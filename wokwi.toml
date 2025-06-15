@@ -1,0 +1,13 @@
+[wokwi]
+version = 1
+firmware = '.pio/build/cyd2usb/firmware.bin'
+elf = '.pio/build/cyd2usb/firmware.elf'
+
+# Enable serial port forwarding for debugging
+rfc2217ServerPort = 4000
+
+# Optional: Enable WiFi gateway if needed for future features
+# [net]
+# [[net.forward]]
+# from = "localhost:8080"
+# to = "target:80"

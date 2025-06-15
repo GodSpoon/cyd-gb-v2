@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build for Wokwi",
+			"type": "shell",
+			"command": "pio",
+			"args": [
+				"run",
+				"-e",
+				"cyd2usb"
+			],
+			"group": "build",
+			"problemMatcher": [
+				"$platformio"
+			]
+		}
+	]
+}

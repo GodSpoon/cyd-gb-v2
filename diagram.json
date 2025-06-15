@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "author": "Anonymous maker",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-s2-devkitm-1", "id": "esp", "top": -4.31, "left": 4.57, "attrs": {} },
+    {
+      "type": "board-ili9341-cap-touch",
+      "id": "lcd1",
+      "top": -32.52,
+      "left": -334.34,
+      "rotate": 270,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "lcd1:VCC", "esp:5V", "red", [ "h67.2", "v52.31" ] ],
+    [ "lcd1:GND", "esp:GND.1", "black", [ "h76.8", "v71.51" ] ],
+    [ "lcd1:CS", "esp:15", "green", [ "h86.4", "v42.71" ] ],
+    [ "lcd1:RST", "esp:2", "green", [ "h57.6", "v-72.49" ] ],
+    [ "lcd1:D/C", "esp:0", "green", [ "h76.8", "v-82.09" ] ],
+    [ "lcd1:MOSI", "esp:13", "green", [ "h96", "v38.4" ] ],
+    [ "lcd1:SCK", "esp:14", "green", [ "h105.6", "v57.6" ] ]
+  ],
+  "dependencies": {}
+}
