@@ -119,5 +119,7 @@ const char* rom_get_title()
 
 const uint8_t *rom_getbytes(void)
 {
+	// In streaming mode, return nullptr to indicate ROM is accessed via streaming
+	// MBC and other components should use espeon_get_rom_bank() instead
 	return bytes;
 }

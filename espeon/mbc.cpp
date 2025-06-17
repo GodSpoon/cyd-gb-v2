@@ -1,8 +1,9 @@
 #include "mbc.h"
 #include "rom.h"
 #include "espeon.h"
+#include <esp_heap_caps.h>
 
-#define SET_ROM_BANK(n)		(rombank = &rom[((n) & (rom_banks - 1)) * 0x4000])
+#define SET_ROM_BANK(n)		(rombank = espeon_get_rom_bank((n) & (rom_banks - 1)))
 #define SET_RAM_BANK(n)		(rambank = &ram[((n) & (ram_banks - 1)) * 0x2000])
 
 static uint32_t curr_rom_bank = 1;
@@ -24,23 +25,83 @@ MBCWriter mbc_write_ram;
 
 bool mbc_init()
 {
+	Serial.println("MBC: Starting initialization");
 	rom = rom_getbytes();
+	Serial.println("MBC: Got ROM bytes");
 	rominfo = rom_get_info();
+	Serial.println("MBC: Got ROM info");
 	
 	rom_banks = rominfo->rom_banks;
 	ram_banks = rominfo->ram_banks;
+	Serial.printf("MBC: ROM banks: %d, RAM banks: %d\n", rom_banks, ram_banks);
 	
 	int ram_size = rom_get_ram_size();
-	ram = (uint8_t *)calloc(1, ram_size < 1024*8 ? 1024*8 : ram_size);
-	if (!ram)
-		return false;
+	Serial.printf("MBC: Need RAM size: %d bytes\n", ram_size);
 	
-	if (rominfo->has_battery && ram_size)
+	// Check available memory before MBC RAM allocation
+	size_t free_heap = ESP.getFreeHeap();
+	Serial.printf("MBC: Available heap: %d bytes\n", free_heap);
+	
+	// Calculate actual allocation size (minimum 8KB for compatibility)
+	size_t alloc_size = (ram_size < 1024*8) ? 1024*8 : ram_size;
+	
+	// Try to use pre-allocated RAM first to avoid fragmentation
+	size_t preallocated_size = 0;
+	ram = espeon_get_preallocated_mbc_ram(&preallocated_size);
+	
+	if (ram && preallocated_size >= alloc_size) {
+		Serial.printf("MBC: Using pre-allocated RAM (%d bytes available)\n", preallocated_size);
+	} else {
+		// Fallback to regular allocation
+		if (ram) {
+			Serial.println("MBC: Pre-allocated RAM too small, freeing and reallocating");
+			free(ram);
+			ram = nullptr;
+		}
+		
+		// Check if we have enough memory for MBC RAM
+		if (free_heap < alloc_size + 30*1024) {
+			Serial.printf("ERROR: MBC: Insufficient memory - need %d bytes, have %d\n", 
+			              alloc_size + 30*1024, free_heap);
+			return false;
+		}
+		
+		// Check largest contiguous block  
+		size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+		Serial.printf("MBC: Largest contiguous block: %d bytes (need %d)\n", largest_block, alloc_size);
+		
+		if (largest_block < alloc_size) {
+			Serial.println("ERROR: MBC: Memory too fragmented for RAM allocation");
+			return false;
+		}
+		
+		Serial.printf("MBC: Attempting to allocate %d bytes of RAM...\n", alloc_size);
+		ram = (uint8_t *)calloc(1, alloc_size);
+		if (!ram) {
+			Serial.println("ERROR: MBC: Failed to allocate RAM");
+			return false;
+		}
+	}
+	Serial.printf("MBC: RAM allocated successfully at %p\n", ram);
+	
+	if (rominfo->has_battery && ram_size) {
+		Serial.println("MBC: Loading SRAM");
 		espeon_load_sram(ram, ram_size);
+	}
 	
+	Serial.println("MBC: Setting ROM bank 1");
 	SET_ROM_BANK(1);
-	SET_RAM_BANK(0);
+	if (!rombank) {
+		Serial.println("ERROR: MBC: Failed to get ROM bank 1");
+		return false;
+	}
+	Serial.println("MBC: ROM bank 1 set successfully");
 	
+	Serial.println("MBC: Setting RAM bank 0");
+	SET_RAM_BANK(0);
+	Serial.println("MBC: RAM bank 0 set successfully");
+	
+	Serial.println("MBC: Setting up MBC type handlers");
 	switch(rominfo->rom_mapper)
 	{
 		case MBC2:
@@ -60,6 +121,7 @@ bool mbc_init()
 		break;
 	}
 	
+	Serial.println("MBC: Initialization completed successfully");
 	return true;
 }
 

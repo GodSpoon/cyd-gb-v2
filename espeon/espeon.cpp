@@ -11,6 +11,7 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <esp_partition.h>
+#include <esp_heap_caps.h>
 
 #include "espeon.h"
 #include "interrupt.h"
@@ -30,6 +31,8 @@ static bool spi_initialized = false;
 
 #define PARTITION_ROM (esp_partition_subtype_t(0x40))
 #define MAX_ROM_SIZE (8*1024*1024)
+#define ROM_BANK_SIZE (16*1024)  // 16KB ROM banks for Game Boy
+#define MAX_ROM_BANKS (1)        // Pre-allocate only 1 bank to save memory
 
 #define JOYPAD_INPUT 5
 #define JOYPAD_ADDR  0x88
@@ -104,15 +107,19 @@ static bool spi_init_sd_interface() {
 	
 	Serial.println("Initializing SD SPI interface...");
 	
-	// Create dedicated SPI instance for SD card 
+	// Create dedicated SPI instance for SD card if not already created
 	if (!sdSPI) {
 		sdSPI = new SPIClass(VSPI);
+		if (!sdSPI) {
+			Serial.println("ERROR: Failed to create SPI instance");
+			return false;
+		}
 	}
 	
-	// Initialize with CYD SD card pins at higher speed
+	// Initialize with CYD SD card pins at optimized speed
 	sdSPI->begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 	
-	// Initialize SD with dedicated SPI instance and optimized speed
+	// Initialize SD with dedicated SPI instance and progressive speed fallback
 	// Try highest speed first, fall back if needed
 	if (SD.begin(SD_CS, *sdSPI, 25000000U)) { // 25MHz
 		Serial.println("SD initialized at 25MHz");
@@ -445,7 +452,191 @@ static inline const uint8_t* espeon_get_last_rom(const esp_partition_t* part)
 	return romdata;
 }
 
-// Static ROM buffer for SD card loaded ROMs
+// ROM streaming system for memory-efficient loading
+static uint8_t* rom_bank_cache[MAX_ROM_BANKS];
+static uint16_t cached_bank_numbers[MAX_ROM_BANKS];
+static uint8_t cache_lru_counter[MAX_ROM_BANKS];
+static uint8_t cache_head = 0;
+static bool rom_streaming_mode = false;
+static File rom_stream_file;
+static String current_rom_path;
+static size_t total_rom_size = 0;
+static uint16_t total_rom_banks = 0;
+
+// Always keep bank 0 in memory for initialization
+static uint8_t* rom_bank0_permanent = nullptr;
+
+// Initialize ROM streaming system
+static bool init_rom_streaming() {
+	// Initialize cache arrays
+	for (int i = 0; i < MAX_ROM_BANKS; i++) {
+		rom_bank_cache[i] = nullptr;
+		cached_bank_numbers[i] = 0xFFFF;  // Invalid bank number
+		cache_lru_counter[i] = 0;
+	}
+	
+	// Check available memory before pre-allocation
+	size_t free_heap = ESP.getFreeHeap();
+	size_t cache_memory_needed = MAX_ROM_BANKS * ROM_BANK_SIZE;
+	Serial.printf("ROM Cache: Available heap: %d, need %d bytes for cache\n", free_heap, cache_memory_needed);
+	
+	// Only pre-allocate cache if we have plenty of memory
+	if (free_heap > cache_memory_needed + 100*1024) {
+		Serial.printf("Pre-allocating %d ROM bank cache slots (%d bytes each)\n", MAX_ROM_BANKS, ROM_BANK_SIZE);
+		for (int i = 0; i < MAX_ROM_BANKS; i++) {
+			rom_bank_cache[i] = (uint8_t*)malloc(ROM_BANK_SIZE);
+			if (!rom_bank_cache[i]) {
+				Serial.printf("WARNING: Failed to pre-allocate ROM bank cache slot %d\n", i);
+				// Clean up any successful allocations
+				for (int j = 0; j < i; j++) {
+					if (rom_bank_cache[j]) {
+						free(rom_bank_cache[j]);
+						rom_bank_cache[j] = nullptr;
+					}
+				}
+				break; // Don't fail completely, just use on-demand allocation
+			}
+			cached_bank_numbers[i] = 0xFFFF; // Mark as empty but allocated
+		}
+		Serial.printf("Successfully pre-allocated %d ROM bank cache slots\n", MAX_ROM_BANKS);
+	} else {
+		Serial.println("ROM Cache: Insufficient memory for pre-allocation, will use on-demand allocation");
+	}
+	
+	cache_head = 0;
+	return true; // Always succeed, cache pre-allocation is optional
+}
+
+// Cleanup ROM streaming system
+static void cleanup_rom_streaming() {
+	// Free all cached banks
+	for (int i = 0; i < MAX_ROM_BANKS; i++) {
+		if (rom_bank_cache[i]) {
+			free(rom_bank_cache[i]);
+			rom_bank_cache[i] = nullptr;
+		}
+		cached_bank_numbers[i] = 0xFFFF;
+		cache_lru_counter[i] = 0;
+	}
+	
+	// Free permanent bank 0
+	if (rom_bank0_permanent) {
+		free(rom_bank0_permanent);
+		rom_bank0_permanent = nullptr;
+	}
+	
+	// Close ROM file if open
+	if (rom_stream_file) {
+		rom_stream_file.close();
+	}
+	
+	rom_streaming_mode = false;
+	total_rom_size = 0;
+	total_rom_banks = 0;
+	current_rom_path = "";
+	cache_head = 0;
+}
+
+// Get ROM bank with caching (streaming mode)
+static const uint8_t* get_rom_bank_streaming(uint16_t bank_number) {
+	// Bank 0 should always use the permanent allocation
+	if (bank_number == 0) {
+		return rom_bank0_permanent;
+	}
+	
+	// Check if bank is already cached
+	for (int i = 0; i < MAX_ROM_BANKS; i++) {
+		if (cached_bank_numbers[i] == bank_number) {
+			// Update LRU counter
+			cache_lru_counter[i] = 255;
+			for (int j = 0; j < MAX_ROM_BANKS; j++) {
+				if (j != i && cache_lru_counter[j] > 0) {
+					cache_lru_counter[j]--;
+				}
+			}
+			return rom_bank_cache[i];
+		}
+	}
+	
+	// Bank not cached, need to load it
+	// Find least recently used slot
+	int lru_slot = 0;
+	for (int i = 1; i < MAX_ROM_BANKS; i++) {
+		if (cache_lru_counter[i] < cache_lru_counter[lru_slot]) {
+			lru_slot = i;
+		}
+	}
+	
+	// Verify the slot has memory allocated or allocate it now
+	if (!rom_bank_cache[lru_slot]) {
+		Serial.printf("ROM bank cache slot %d not pre-allocated, allocating on-demand...\n", lru_slot);
+		rom_bank_cache[lru_slot] = (uint8_t*)malloc(ROM_BANK_SIZE);
+		if (!rom_bank_cache[lru_slot]) {
+			Serial.printf("ERROR: Failed to allocate ROM bank cache slot %d on-demand\n", lru_slot);
+			return nullptr;
+		}
+		cached_bank_numbers[lru_slot] = 0xFFFF; // Mark as empty but allocated
+	}
+	
+	// Load bank from SD card with simplified approach
+	if (!spi_acquire_lock(1000)) {
+		Serial.printf("ERROR: Failed to acquire SPI lock for ROM bank %d\n", bank_number);
+		free(rom_bank_cache[lru_slot]);
+		rom_bank_cache[lru_slot] = nullptr;
+		return nullptr;
+	}
+	
+	// Open ROM file for this read operation
+	File romFile = SD.open(current_rom_path.c_str(), FILE_READ);
+	if (!romFile) {
+		Serial.printf("ERROR: Failed to open ROM file for bank %d: %s\n", bank_number, current_rom_path.c_str());
+		spi_release_lock();
+		free(rom_bank_cache[lru_slot]);
+		rom_bank_cache[lru_slot] = nullptr;
+		return nullptr;
+	}
+	
+	// Seek to bank position and read
+	size_t bank_offset = bank_number * ROM_BANK_SIZE;
+	if (bank_offset >= total_rom_size) {
+		Serial.printf("ERROR: ROM bank %d exceeds ROM size\n", bank_number);
+		romFile.close();
+		spi_release_lock();
+		free(rom_bank_cache[lru_slot]);
+		rom_bank_cache[lru_slot] = nullptr;
+		return nullptr;
+	}
+	
+	romFile.seek(bank_offset);
+	size_t bytes_to_read = (ROM_BANK_SIZE < (total_rom_size - bank_offset)) ? ROM_BANK_SIZE : (total_rom_size - bank_offset);
+	size_t bytes_read = romFile.read(rom_bank_cache[lru_slot], bytes_to_read);
+	
+	romFile.close(); // Always close the file after reading
+	spi_release_lock();
+	
+	if (bytes_read != bytes_to_read) {
+		Serial.printf("ERROR: ROM bank %d read error: got %d, expected %d bytes\n", bank_number, bytes_read, bytes_to_read);
+		free(rom_bank_cache[lru_slot]);
+		rom_bank_cache[lru_slot] = nullptr;
+		return nullptr;
+	}
+	
+	// Update cache info
+	cached_bank_numbers[lru_slot] = bank_number;
+	cache_lru_counter[lru_slot] = 255;
+	
+	// Age other cache entries
+	for (int i = 0; i < MAX_ROM_BANKS; i++) {
+		if (i != lru_slot && cache_lru_counter[i] > 0) {
+			cache_lru_counter[i]--;
+		}
+	}
+	
+	Serial.printf("Loaded ROM bank %d into cache slot %d\n", bank_number, lru_slot);
+	return rom_bank_cache[lru_slot];
+}
+
+// Static ROM buffer for SD card loaded ROMs (legacy mode for small ROMs)
 static uint8_t* sd_rom_data = nullptr;
 
 const uint8_t* espeon_load_rom(const char* path)
@@ -488,10 +679,45 @@ const uint8_t* espeon_load_rom(const char* path)
 		return nullptr;
 	}
 	
-	// Force garbage collection before file operations
-	delay(100);
+	// Minimal SD health check and potential reinitialization
+	tft.setCursor(10, 100);
+	tft.setTextColor(TFT_CYAN);
+	tft.print("Checking SD card...");
 	
-	// Try to open ROM file directly 
+	// Try to open root directory as a health check
+	File root = SD.open("/");
+	if (!root) {
+		Serial.println("SD card health check failed, attempting reinitialization...");
+		tft.setCursor(10, 120);
+		tft.setTextColor(TFT_YELLOW);
+		tft.print("Reinitializing SD...");
+		
+		// Simple reinitialization
+		SD.end();
+		delay(100);
+		if (!SD.begin(SD_CS, *sdSPI, 4000000U)) {
+			Serial.println("CRITICAL: SD card reinitialization failed!");
+			spi_release_lock();
+			
+			tft.fillScreen(TFT_BLACK);
+			tft.setTextColor(TFT_RED);
+			tft.setTextSize(2);
+			tft.setCursor(10, 50);
+			tft.print("SD Error!");
+			delay(3000);
+			return nullptr;
+		}
+		Serial.println("SD card reinitialized successfully");
+	} else {
+		root.close();
+		Serial.println("SD card health check passed");
+	}
+	
+	// Now try to open ROM file
+	tft.setCursor(10, 140);
+	tft.setTextColor(TFT_GREEN);
+	tft.print("Opening ROM file...");
+	
 	File romfile = SD.open(path, FILE_READ);
 	if (!romfile) {
 		Serial.printf("Failed to open ROM file: %s\n", path);
@@ -513,10 +739,11 @@ const uint8_t* espeon_load_rom(const char* path)
 	Serial.printf("ROM file size: %d bytes\n", romsize);
 	
 	// Update display with size info
-	tft.setCursor(10, 100);
+	tft.setCursor(10, 160);
+	tft.setTextColor(TFT_GREEN);
 	tft.printf("Size: %d bytes", romsize);
 	
-	// Check ROM size limit - be more generous for compatibility
+	// Check ROM size limit
 	if (romsize > 8*1024*1024) { // 8MB limit
 		Serial.printf("ROM too large: %d bytes\n", romsize);
 		romfile.close();
@@ -524,108 +751,165 @@ const uint8_t* espeon_load_rom(const char* path)
 		return nullptr;
 	}
 	
-	// Free previous ROM data if it exists
+	// Clean up any existing ROM data
 	if (sd_rom_data) {
 		free(sd_rom_data);
 		sd_rom_data = nullptr;
-		// Force garbage collection after freeing
-		delay(50);
 	}
+	cleanup_rom_streaming();
 	
-	// Check available memory before allocation
+	// Check if we should use streaming mode (for ROMs > 200KB)
 	size_t free_heap = ESP.getFreeHeap();
-	size_t needed = romsize + 1024; // Extra 1KB for safety
+	size_t memory_threshold = 200*1024; // 200KB threshold
 	
-	Serial.printf("Free heap: %d bytes, needed: %d bytes\n", free_heap, needed);
-	
-	if (free_heap < needed + 100*1024) { // Need at least 100KB extra
-		Serial.println("Insufficient memory for ROM loading");
+	if (romsize > memory_threshold || free_heap < romsize + 100*1024) {
+		Serial.printf("Using ROM streaming mode for %d byte ROM (free heap: %d)\n", romsize, free_heap);
+		
+		// Initialize streaming mode
+		if (!init_rom_streaming()) {
+			Serial.println("Failed to initialize ROM streaming (pre-allocation failed)");
+			romfile.close();
+			spi_release_lock();
+			
+			tft.fillScreen(TFT_BLACK);
+			tft.setTextColor(TFT_RED);
+			tft.setTextSize(2);
+			tft.setCursor(10, 50);
+			tft.print("Cache Alloc Error!");
+			delay(3000);
+			return nullptr;
+		}
+		rom_streaming_mode = true;
+		current_rom_path = String(path);
+		total_rom_size = romsize;
+		total_rom_banks = (romsize + ROM_BANK_SIZE - 1) / ROM_BANK_SIZE;
+		
+		// Always load bank 0 permanently for initialization
+		rom_bank0_permanent = (uint8_t*)malloc(ROM_BANK_SIZE);
+		if (!rom_bank0_permanent) {
+			Serial.println("Failed to allocate permanent bank 0");
+			romfile.close();
+			spi_release_lock();
+			cleanup_rom_streaming();
+			
+			tft.fillScreen(TFT_BLACK);
+			tft.setTextColor(TFT_RED);
+			tft.setTextSize(2);
+			tft.setCursor(10, 50);
+			tft.print("Bank 0 Alloc Error!");
+			delay(3000);
+			return nullptr;
+		}
+		
+		// Read bank 0 data directly from the already open file
+		romfile.seek(0);
+		size_t bank0_size = (ROM_BANK_SIZE < romsize) ? ROM_BANK_SIZE : romsize;
+		size_t bytes_read = romfile.read(rom_bank0_permanent, bank0_size);
+		romfile.close(); // Close the file, streaming will reopen as needed
+		
+		if (bytes_read != bank0_size) {
+			Serial.printf("Failed to read bank 0: got %d, expected %d bytes\n", bytes_read, bank0_size);
+			spi_release_lock();
+			cleanup_rom_streaming();
+			
+			tft.fillScreen(TFT_BLACK);
+			tft.setTextColor(TFT_RED);
+			tft.setTextSize(2);
+			tft.setCursor(10, 50);
+			tft.print("Bank 0 Read Error!");
+			delay(3000);
+			return nullptr;
+		}
+		
+		spi_release_lock();
+		
+		// Show success message
+		tft.setCursor(10, 200);
+		tft.setTextColor(TFT_GREEN);
+		tft.print("ROM streaming ready!");
+		delay(1000);
+		
+		Serial.printf("ROM streaming initialized: %d banks, bank 0 loaded permanently\n", total_rom_banks);
+		return rom_bank0_permanent; // Return pointer to bank 0
+		
+	} else {
+		Serial.printf("Using legacy mode for %d byte ROM (free heap: %d)\n", romsize, free_heap);
+		
+		// Use legacy full-ROM-in-memory mode for small ROMs
+		size_t needed = romsize + 1024; // Extra 1KB for safety
+		
+		// Allocate memory for ROM data
+		sd_rom_data = (uint8_t*)malloc(needed);
+		if (!sd_rom_data) {
+			Serial.println("Failed to allocate ROM memory");
+			romfile.close();
+			spi_release_lock();
+			
+			tft.fillScreen(TFT_BLACK);
+			tft.setTextColor(TFT_RED);
+			tft.setTextSize(2);
+			tft.setCursor(10, 50);
+			tft.print("Alloc Failed!");
+			delay(3000);
+			return nullptr;
+		}
+		
+		Serial.printf("Successfully allocated %d bytes for ROM\n", needed);
+		
+		// Update display
+		tft.setCursor(10, 180);
+		tft.setTextColor(TFT_CYAN);
+		tft.print("Reading ROM data...");
+		
+		// Read ROM data from SD card in chunks
+		size_t bytesRead = 0;
+		size_t chunkSize = 4096; // 4KB chunks
+		uint8_t* writePtr = sd_rom_data;
+		
+		romfile.seek(0);
+		
+		while (bytesRead < romsize) {
+			size_t toRead = (chunkSize < (romsize - bytesRead)) ? chunkSize : (romsize - bytesRead);
+			size_t read = romfile.read(writePtr, toRead);
+			
+			if (read == 0) {
+				Serial.println("SD read error - reached EOF early");
+				break;
+			}
+			
+			bytesRead += read;
+			writePtr += read;
+			
+			// Show progress every 32KB
+			if (bytesRead % (32*1024) == 0 || bytesRead == romsize) {
+				tft.setCursor(10, 200);
+				tft.setTextColor(TFT_YELLOW);
+				tft.printf("Read: %d/%d KB", bytesRead/1024, romsize/1024);
+			}
+			
+			// Yield occasionally to avoid watchdog
+			if (bytesRead % (16*1024) == 0) {
+				yield();
+			}
+		}
+		
 		romfile.close();
 		spi_release_lock();
 		
-		tft.fillScreen(TFT_BLACK);
-		tft.setTextColor(TFT_RED);
-		tft.setTextSize(2);
-		tft.setCursor(10, 50);
-		tft.print("Memory Error!");
-		tft.setTextSize(1);
-		tft.setCursor(10, 80);
-		tft.printf("Need %dKB, have %dKB", needed/1024, free_heap/1024);
-		delay(3000);
-		return nullptr;
-	}
-	
-	// Allocate memory for ROM data with some extra space
-	sd_rom_data = (uint8_t*)malloc(needed);
-	if (!sd_rom_data) {
-		Serial.println("Failed to allocate ROM memory");
-		romfile.close();
-		spi_release_lock();
-		
-		tft.fillScreen(TFT_BLACK);
-		tft.setTextColor(TFT_RED);
-		tft.setTextSize(2);
-		tft.setCursor(10, 50);
-		tft.print("Alloc Failed!");
-		delay(3000);
-		return nullptr;
-	}
-	
-	Serial.printf("Successfully allocated %d bytes for ROM\n", needed);
-	
-	// Update display
-	tft.setCursor(10, 120);
-	tft.setTextColor(TFT_CYAN);
-	tft.print("Reading ROM data...");
-	
-	// Read ROM data from SD card in chunks for better stability
-	size_t bytesRead = 0;
-	size_t chunkSize = 4096; // 4KB chunks
-	uint8_t* writePtr = sd_rom_data;
-	
-	romfile.seek(0);
-	
-	while (bytesRead < romsize) {
-		size_t toRead = min(chunkSize, romsize - bytesRead);
-		size_t read = romfile.read(writePtr, toRead);
-		
-		if (read == 0) {
-			Serial.println("SD read error - reached EOF early");
-			break;
+		if (bytesRead != romsize) {
+			Serial.printf("Warning: Only read %d of %d bytes\n", bytesRead, romsize);
+			// Still proceed as partial ROMs might work for testing
 		}
 		
-		bytesRead += read;
-		writePtr += read;
+		// Show success message
+		tft.setCursor(10, 220);
+		tft.setTextColor(TFT_GREEN);
+		tft.print("ROM loaded successfully!");
+		delay(1000);
 		
-		// Show progress every 64KB
-		if (bytesRead % (64*1024) == 0 || bytesRead == romsize) {
-			tft.setCursor(10, 140);
-			tft.setTextColor(TFT_YELLOW);
-			tft.printf("Read: %d/%d KB", bytesRead/1024, romsize/1024);
-		}
-		
-		// Yield occasionally to avoid watchdog
-		if (bytesRead % (16*1024) == 0) {
-			yield();
-		}
+		Serial.printf("Successfully loaded %d bytes in legacy mode\n", bytesRead);
+		return sd_rom_data;
 	}
-	
-	romfile.close();
-	spi_release_lock();
-	
-	if (bytesRead != romsize) {
-		Serial.printf("Warning: Only read %d of %d bytes\n", bytesRead, romsize);
-		// Still proceed as partial ROMs might work for testing
-	}
-	
-	// Show success message
-	tft.setCursor(10, 160);
-	tft.setTextColor(TFT_GREEN);
-	tft.print("ROM loaded successfully!");
-	delay(1000);
-	
-	Serial.printf("Successfully loaded %d bytes from SD card ROM\n", bytesRead);
-	return sd_rom_data;
 }
 
 void espeon_set_brightness(uint8_t brightness)
@@ -652,7 +936,12 @@ void espeon_cleanup_rom()
 	if (sd_rom_data) {
 		free(sd_rom_data);
 		sd_rom_data = nullptr;
-		Serial.println("ROM memory cleaned up");
+		Serial.println("Legacy ROM memory cleaned up");
+	}
+	
+	if (rom_streaming_mode) {
+		cleanup_rom_streaming();
+		Serial.println("ROM streaming cleaned up");
 	}
 }
 
@@ -674,16 +963,104 @@ void espeon_cleanup_spi()
 	Serial.println("SPI resources cleaned up");
 }
 
-// Memory management optimization
+// Memory management optimization with actual cleanup
 void espeon_check_memory() {
-	Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-	Serial.printf("Min free heap: %d bytes\n", ESP.getMinFreeHeap());
-	Serial.printf("Heap size: %d bytes\n", ESP.getHeapSize());
+	size_t free_heap = ESP.getFreeHeap();
+	size_t min_free = ESP.getMinFreeHeap();
+	size_t heap_size = ESP.getHeapSize();
 	
-	// Free up any unused memory if heap is low
-	if (ESP.getFreeHeap() < 512*1024) {
-		Serial.println("Low memory detected, attempting cleanup...");
-		// Force garbage collection and heap defragmentation
-		delay(100);
+	Serial.printf("Free heap: %d bytes\n", free_heap);
+	Serial.printf("Min free heap: %d bytes\n", min_free);
+	Serial.printf("Heap size: %d bytes\n", heap_size);
+	
+	// Attempt memory cleanup if heap is low
+	if (free_heap < 300*1024) {  // Less than 300KB available
+		Serial.println("Low memory detected, performing cleanup...");
+		
+		// Clear any cached ROM banks if in streaming mode
+		if (rom_streaming_mode) {
+			for (int i = 0; i < MAX_ROM_BANKS; i++) {
+				if (rom_bank_cache[i] && cached_bank_numbers[i] > 1) { // Keep banks 0 and 1
+					Serial.printf("Clearing cached ROM bank %d\n", cached_bank_numbers[i]);
+					free(rom_bank_cache[i]);
+					rom_bank_cache[i] = nullptr;
+					cached_bank_numbers[i] = 0xFFFF;
+					cache_lru_counter[i] = 0;
+				}
+			}
+		}
+		
+		// Force heap compaction
+		heap_caps_check_integrity_all(true);
+		delay(50);
+		
+		Serial.printf("After cleanup - Free heap: %d bytes\n", ESP.getFreeHeap());
 	}
+}
+
+// Get ROM bank data (supports both legacy and streaming modes)
+const uint8_t* espeon_get_rom_bank(uint16_t bank_number) {
+	// Special case: Bank 0 is always available
+	if (bank_number == 0) {
+		if (rom_streaming_mode && rom_bank0_permanent) {
+			return rom_bank0_permanent;
+		} else if (sd_rom_data) {
+			return sd_rom_data; // In legacy mode, bank 0 is at the start
+		} else {
+			Serial.println("ERROR: No ROM loaded for bank 0 request");
+			return nullptr;
+		}
+	}
+	
+	if (rom_streaming_mode) {
+		// Use streaming mode for banks > 0
+		return get_rom_bank_streaming(bank_number);
+	} else if (sd_rom_data) {
+		// Use legacy mode - calculate offset in the full ROM data
+		size_t bank_offset = bank_number * ROM_BANK_SIZE;
+		// Note: In legacy mode we have the full ROM in memory, so just return offset
+		return sd_rom_data + bank_offset;
+	} else {
+		// No ROM loaded
+		Serial.printf("ERROR: No ROM loaded for bank %d request\n", bank_number);
+		return nullptr;
+	}
+}
+
+// Pre-allocated main memory management  
+static uint8_t* preallocated_main_mem = nullptr;
+
+void espeon_set_preallocated_main_mem(uint8_t* mem) {
+	preallocated_main_mem = mem;
+	Serial.printf("Set pre-allocated main memory: %p\n", mem);
+}
+
+uint8_t* espeon_get_preallocated_main_mem() {
+	if (preallocated_main_mem) {
+		uint8_t* mem = preallocated_main_mem;
+		preallocated_main_mem = nullptr; // Transfer ownership
+		return mem;
+	}
+	return nullptr;
+}
+
+// Pre-allocated MBC RAM management
+static uint8_t* preallocated_mbc_ram = nullptr;
+static size_t preallocated_mbc_size = 0;
+
+void espeon_set_preallocated_mbc_ram(uint8_t* ram, size_t size) {
+	preallocated_mbc_ram = ram;
+	preallocated_mbc_size = size;
+	Serial.printf("Set pre-allocated MBC RAM: %p, size: %d\n", ram, size);
+}
+
+uint8_t* espeon_get_preallocated_mbc_ram(size_t* size) {
+	if (preallocated_mbc_ram && size) {
+		*size = preallocated_mbc_size;
+		uint8_t* ram = preallocated_mbc_ram;
+		preallocated_mbc_ram = nullptr; // Transfer ownership
+		preallocated_mbc_size = 0;
+		return ram;
+	}
+	return nullptr;
 }

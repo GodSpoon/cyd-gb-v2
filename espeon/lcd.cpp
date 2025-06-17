@@ -446,13 +446,22 @@ void lcd_cycle(uint32_t cycles)
 
 bool lcd_init()
 {	
+	Serial.println("LCD: Starting initialization");
 	lcdqueue = xQueueCreate(143, sizeof(LCDC));
-	if(!lcdqueue)
+	if(!lcdqueue) {
+		Serial.println("ERROR: LCD: Failed to create queue");
 		return false;
+	}
+	Serial.println("LCD: Queue created successfully");
 	
+	Serial.println("LCD: Writing control register");
 	lcd_write_control(mem[0xFF40]);
+	Serial.println("LCD: Control register written");
 	
+	Serial.println("LCD: Creating render task");
 	xTaskCreatePinnedToCore(&render_line, "renderScanline", 4096, NULL, 5, NULL, 0);
+	Serial.println("LCD: Render task created");
 	
+	Serial.println("LCD: Initialization completed successfully");
 	return true;
 }

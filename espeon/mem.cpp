@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <esp_heap_caps.h>
 #include "mem.h"
 #include "rom.h"
 #include "lcd.h"
@@ -8,6 +9,7 @@
 #include "interrupt.h"
 #include "timer.h"
 #include "cpu.h"
+#include "espeon.h"
 
 bool usebootrom = false;
 uint8_t *mem = nullptr;
@@ -113,7 +115,13 @@ void mem_write_byte(uint16_t d, uint8_t i)
 		case 0xFF49: lcd_write_spr_palette2(i); break;
 		case 0xFF4A: lcd_set_window_y(i); break;
 		case 0xFF4B: lcd_set_window_x(i); break;
-		case 0xFF50: memcpy(&mem[0x0000], &rom[0x0000], 0x100); break; /* Lock bootROM */
+		case 0xFF50: { /* Lock bootROM */
+			const uint8_t* rom_bank0 = espeon_get_rom_bank(0);
+			if (rom_bank0) {
+				memcpy(&mem[0x0000], &rom_bank0[0x0000], 0x100);
+			}
+			break;
+		}
 		case 0xFFFF: IE = i; break;
 
 		default: mem[d] = i; break;
@@ -122,25 +130,100 @@ void mem_write_byte(uint16_t d, uint8_t i)
 
 bool mmu_init(const uint8_t* bootrom)
 {
-	mem = (uint8_t *)calloc(1, 0x10000);
-	if (!mem)
-		return false;
+	Serial.println("MMU: Starting initialization");
 	
-	if (!mbc_init())
-		return false;
+	// Main Game Boy memory: 64KB (0x10000)
+	const size_t main_mem_size = 0x10000;
 	
+	// PRIORITY 1: Try to use pre-allocated main memory first (CRITICAL for fragmented heap)
+	mem = espeon_get_preallocated_main_mem();
+	if (mem) {
+		Serial.printf("MMU: Using pre-allocated main memory at %p\n", mem);
+	} else {
+		// Pre-allocation failed, check if we can still allocate
+		Serial.println("MMU: Pre-allocated memory not available, checking fragmentation...");
+		
+		// Check available memory before allocation  
+		size_t free_heap = ESP.getFreeHeap();
+		Serial.printf("MMU: Available heap: %d bytes\n", free_heap);
+		
+		// Check if we have enough memory (need 64KB + safety margin)
+		if (free_heap < main_mem_size + 50*1024) {
+			Serial.printf("ERROR: MMU: Insufficient memory - need %d bytes, have %d\n", 
+			              main_mem_size + 50*1024, free_heap);
+			
+			// Aggressive cleanup before giving up
+			Serial.println("MMU: Performing emergency memory cleanup...");
+			espeon_cleanup_rom();
+			delay(100);
+			
+			free_heap = ESP.getFreeHeap();
+			Serial.printf("MMU: Available heap after cleanup: %d bytes\n", free_heap);
+			
+			if (free_heap < main_mem_size + 20*1024) {
+				Serial.println("ERROR: MMU: Still insufficient memory after cleanup");
+				return false;
+			}
+		}
+		
+		// Check largest contiguous block
+		size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+		Serial.printf("MMU: Largest contiguous block: %d bytes (need %d)\n", largest_block, main_mem_size);
+		
+		if (largest_block < main_mem_size) {
+			Serial.println("ERROR: MMU: Memory too fragmented for 64KB allocation");
+			Serial.println("MMU: Try restarting device for fresh memory layout");
+			return false;
+		}
+		
+		// Allocate main Game Boy memory
+		Serial.println("MMU: Attempting to allocate main memory...");
+		mem = (uint8_t*)calloc(1, main_mem_size);
+		if (!mem) {
+			Serial.println("ERROR: MMU: Failed to allocate main memory");
+			return false;
+		}
+		Serial.printf("MMU: Main memory allocated successfully at %p\n", mem);
+	}
+	
+	Serial.println("MMU: Initializing MBC");
+	if (!mbc_init()) {
+		Serial.println("ERROR: MMU: MBC initialization failed");
+		return false;
+	}
+	Serial.println("MMU: MBC initialized successfully");
+	
+	Serial.println("MMU: Getting ROM bytes");
 	rom = rom_getbytes();
+	Serial.println("MMU: Setting up echo memory");
 	echo = mem + 0xC000 - 0xE000;
 	
 	if (bootrom) {
+		Serial.println("MMU: Copying bootrom to memory");
 		memcpy(&mem[0x0000], &bootrom[0x0000], 0x100);
-		memcpy(&mem[0x0100], &rom[0x0100], 0x4000 - 0x100);
+		// Get bank 0 data for ROM initialization
+		Serial.println("MMU: Getting ROM bank 0 for bootrom mode");
+		const uint8_t* rom_bank0 = espeon_get_rom_bank(0);
+		if (rom_bank0) {
+			Serial.println("MMU: Copying ROM bank 0 data");
+			memcpy(&mem[0x0100], &rom_bank0[0x0100], 0x4000 - 0x100);
+		} else {
+			Serial.println("ERROR: MMU: Failed to get ROM bank 0 for bootrom mode");
+		}
 		usebootrom = true;
+		Serial.println("MMU: Bootrom mode initialization complete");
 		return true;
 	}
 	
-	// First ROM bank is always in RAM
-	memcpy(&mem[0x0000], &rom[0x0000], 0x4000);
+	// First ROM bank is always in RAM - get bank 0
+	Serial.println("MMU: Getting ROM bank 0 for normal mode");
+	const uint8_t* rom_bank0 = espeon_get_rom_bank(0);
+	if (rom_bank0) {
+		Serial.println("MMU: Copying ROM bank 0 data to memory");
+		memcpy(&mem[0x0000], &rom_bank0[0x0000], 0x4000);
+	} else {
+		Serial.println("ERROR: MMU: Failed to get ROM bank 0 for normal mode");
+	}
 
 	// Default values if bootrom is not present
 	mem[0xFF10] = 0x80;
@@ -163,5 +246,6 @@ bool mmu_init(const uint8_t* bootrom)
 	mem[0xFF48] = 0xFF;
 	mem[0xFF49] = 0xFF;
 	
+	Serial.println("MMU: Initialization completed successfully");
 	return true;
 }
