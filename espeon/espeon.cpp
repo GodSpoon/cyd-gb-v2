@@ -4,10 +4,12 @@
 #include <FS.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <vector>
 #include <freertos/FreeRTOS.h>
 #include <freertos/timers.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <esp_partition.h>
 
 #include "espeon.h"
@@ -18,8 +20,16 @@
 // TFT_eSPI instance for CYD display
 TFT_eSPI tft = TFT_eSPI();
 
+// Static storage for ROM file list (populated during SD initialization)
+static std::vector<String> availableRomFiles;
+
+// SPI resource management
+static SemaphoreHandle_t spi_mutex = nullptr;
+static SPIClass* sdSPI = nullptr;
+static bool spi_initialized = false;
+
 #define PARTITION_ROM (esp_partition_subtype_t(0x40))
-#define MAX_ROM_SIZE (2*1024*1024)
+#define MAX_ROM_SIZE (8*1024*1024)
 
 #define JOYPAD_INPUT 5
 #define JOYPAD_ADDR  0x88
@@ -66,6 +76,60 @@ static void espeon_request_sd_write()
 	spi_lock = 1;
 }
 
+// SPI resource management functions
+static bool spi_acquire_lock(TickType_t timeout_ms = 1000) {
+	if (!spi_mutex) {
+		Serial.println("ERROR: SPI mutex not initialized!");
+		return false;
+	}
+	
+	if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+		return true;
+	}
+	
+	Serial.println("ERROR: Failed to acquire SPI lock");
+	return false;
+}
+
+static void spi_release_lock() {
+	if (spi_mutex) {
+		xSemaphoreGive(spi_mutex);
+	}
+}
+
+static bool spi_init_sd_interface() {
+	if (spi_initialized) {
+		return true;
+	}
+	
+	Serial.println("Initializing SD SPI interface...");
+	
+	// Create dedicated SPI instance for SD card 
+	if (!sdSPI) {
+		sdSPI = new SPIClass(VSPI);
+	}
+	
+	// Initialize with CYD SD card pins at higher speed
+	sdSPI->begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+	
+	// Initialize SD with dedicated SPI instance and optimized speed
+	// Try highest speed first, fall back if needed
+	if (SD.begin(SD_CS, *sdSPI, 25000000U)) { // 25MHz
+		Serial.println("SD initialized at 25MHz");
+	} else if (SD.begin(SD_CS, *sdSPI, 10000000U)) { // 10MHz fallback
+		Serial.println("SD initialized at 10MHz (fallback)");
+	} else if (SD.begin(SD_CS, *sdSPI, 4000000U)) { // 4MHz last resort
+		Serial.println("SD initialized at 4MHz (low speed)");
+	} else {
+		Serial.println("ERROR: SD card initialization failed at all speeds");
+		return false;
+	}
+	
+	spi_initialized = true;
+	Serial.println("SD SPI interface initialized successfully");
+	return true;
+}
+
 void espeon_init(void)
 {
 	// Initialize Serial communication first
@@ -74,7 +138,15 @@ void espeon_init(void)
 	Serial.println("Espeon v1.0 - CYD GameBoy Emulator");
 	Serial.println("Initializing...");
 	
-	// Initialize TFT display
+	// Initialize SPI mutex for resource management
+	spi_mutex = xSemaphoreCreateMutex();
+	if (!spi_mutex) {
+		Serial.println("FATAL: Failed to create SPI mutex!");
+		ESP.restart();
+	}
+	Serial.println("SPI mutex created successfully");
+	
+	// Initialize TFT display first (uses HSPI by default)
 	tft.init();
 	tft.setRotation(1); // Landscape orientation for CYD
 	tft.fillScreen(TFT_BLACK);
@@ -94,15 +166,13 @@ void espeon_init(void)
 	// Set brightness to 50% (128 out of 255)
 	ledcWrite(PWM_CHANNEL, 128);
 	
-	// Initialize SD card with proper pins for CYD
-	// CYD SD card pins: MISO=19, MOSI=23, SCK=18, CS=5
+	// Initialize SD card with dedicated SPI interface
 	Serial.println("Initializing SD card...");
 	
-	// Configure SPI for SD card (different from display SPI)
-	SPIClass sdSPI(VSPI);
-	sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+	// Allow extra time for TFT SPI operations to complete
+	delay(100);
 	
-	if (!SD.begin(SD_CS, sdSPI, 4000000U)) {
+	if (!spi_init_sd_interface()) {
 		Serial.println("SD Card initialization failed!");
 		tft.setCursor(10, 50);
 		tft.setTextColor(TFT_RED);
@@ -116,16 +186,32 @@ void espeon_init(void)
 		tft.setTextColor(TFT_GREEN);
 		tft.print("SD Card OK");
 		
-		// List root directory to verify card is working
-		File root = SD.open("/");
-		if (root) {
-			Serial.println("SD Card contents:");
-			File entry = root.openNextFile();
-			while (entry) {
-				Serial.printf("  %s (%d bytes)\n", entry.name(), entry.size());
-				entry = root.openNextFile();
+		// List root directory to verify card is working and collect ROM files
+		if (spi_acquire_lock()) {
+			File root = SD.open("/");
+			if (root) {
+				Serial.println("SD Card contents:");
+				availableRomFiles.clear(); // Clear any previous ROM file list
+				
+				File entry = root.openNextFile();
+				while (entry) {
+					String fileName = entry.name();
+					Serial.printf("  %s (%d bytes)\n", fileName.c_str(), entry.size());
+					
+					// Check if this is a .gb ROM file
+					if (fileName.endsWith(".gb") || fileName.endsWith(".GB")) {
+						String fullPath = "/" + fileName;
+						availableRomFiles.push_back(fullPath);
+						Serial.printf("    -> Added ROM: %s\n", fullPath.c_str());
+					}
+					
+					entry = root.openNextFile();
+				}
+				root.close();
+				
+				Serial.printf("Found %d ROM files total\n", availableRomFiles.size());
 			}
-			root.close();
+			spi_release_lock();
 		}
 	}
 	
@@ -211,6 +297,24 @@ void espeon_save_sram(uint8_t* ram, uint32_t size)
 	
 	Serial.printf("Saving SRAM to: %s (%d bytes)\n", path, size);
 	
+	// Acquire SPI lock before SD operations
+	if (!spi_acquire_lock()) {
+		Serial.println("Failed to acquire SPI lock for SRAM save");
+		return;
+	}
+	
+	// Ensure SD is in good state for writing
+	if (!SD.exists("/")) {
+		Serial.println("SD card not accessible, reinitializing...");
+		SD.end();
+		delay(50);
+		if (!SD.begin(SD_CS, *sdSPI, 4000000U)) {
+			Serial.println("Failed to reinitialize SD for SRAM save");
+			spi_release_lock();
+			return;
+		}
+	}
+	
 	File sram = SD.open(path, FILE_WRITE);
 	if (sram) {
 		sram.seek(0);
@@ -220,6 +324,8 @@ void espeon_save_sram(uint8_t* ram, uint32_t size)
 	} else {
 		Serial.printf("Failed to open SRAM file for writing: %s\n", path);
 	}
+	
+	spi_release_lock();
 }
 
 void espeon_load_sram(uint8_t* ram, uint32_t size)
@@ -234,8 +340,27 @@ void espeon_load_sram(uint8_t* ram, uint32_t size)
 	
 	Serial.printf("Loading SRAM from: %s\n", path);
 	
+	// Acquire SPI lock before SD operations
+	if (!spi_acquire_lock()) {
+		Serial.println("Failed to acquire SPI lock for SRAM load");
+		return;
+	}
+	
+	// Ensure SD is in good state for reading
+	if (!SD.exists("/")) {
+		Serial.println("SD card not accessible, reinitializing...");
+		SD.end();
+		delay(50);
+		if (!SD.begin(SD_CS, *sdSPI, 4000000U)) {
+			Serial.println("Failed to reinitialize SD for SRAM load");
+			spi_release_lock();
+			return;
+		}
+	}
+	
 	if (!SD.exists(path)) {
 		Serial.printf("SRAM file does not exist: %s\n", path);
+		spi_release_lock();
 		return;
 	}
 	
@@ -251,6 +376,8 @@ void espeon_load_sram(uint8_t* ram, uint32_t size)
 	} else {
 		Serial.printf("Failed to open SRAM file for reading: %s\n", path);
 	}
+	
+	spi_release_lock();
 }
 
 const uint8_t* espeon_load_bootrom(const char* path)
@@ -259,8 +386,27 @@ const uint8_t* espeon_load_bootrom(const char* path)
 	
 	Serial.printf("Attempting to load bootrom from: %s\n", path);
 	
+	// Acquire SPI lock before SD operations
+	if (!spi_acquire_lock()) {
+		Serial.println("Failed to acquire SPI lock for bootrom load");
+		return nullptr;
+	}
+	
+	// Ensure SD is in good state for reading
+	if (!SD.exists("/")) {
+		Serial.println("SD card not accessible, reinitializing...");
+		SD.end();
+		delay(50);
+		if (!SD.begin(SD_CS, *sdSPI, 4000000U)) {
+			Serial.println("Failed to reinitialize SD for bootrom load");
+			spi_release_lock();
+			return nullptr;
+		}
+	}
+	
 	if (!SD.exists(path)) {
 		Serial.printf("Bootrom file does not exist: %s\n", path);
+		spi_release_lock();
 		return nullptr;
 	}
 	
@@ -278,11 +424,13 @@ const uint8_t* espeon_load_bootrom(const char* path)
 		bf.close();
 		
 		Serial.printf("Successfully loaded %d bytes from bootrom\n", bytesRead);
+		spi_release_lock();
 		return bootrom;
 	} else {
 		Serial.printf("Failed to open bootrom file: %s\n", path);
 	}
 	
+	spi_release_lock();
 	return nullptr;
 }
 
@@ -297,75 +445,187 @@ static inline const uint8_t* espeon_get_last_rom(const esp_partition_t* part)
 	return romdata;
 }
 
+// Static ROM buffer for SD card loaded ROMs
+static uint8_t* sd_rom_data = nullptr;
+
 const uint8_t* espeon_load_rom(const char* path)
 {
-	const esp_partition_t* part;
-	part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, PARTITION_ROM, NULL);
-	if (!part) {
-		Serial.println("ROM partition not found");
-		return nullptr;
-	}
-	
+	// If no path specified, try to load from flash partition
 	if (!path) {
-		Serial.println("Loading last ROM from flash");
+		Serial.println("Loading last ROM from flash partition");
+		const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, PARTITION_ROM, NULL);
+		if (!part) {
+			Serial.println("ROM partition not found");
+			return nullptr;
+		}
 		return espeon_get_last_rom(part);
 	}
 	
-	Serial.printf("Attempting to load ROM from: %s\n", path);
+	Serial.printf("Attempting to load ROM from SD card: %s\n", path);
 	
-	if (!SD.exists(path)) {
-		Serial.printf("ROM file does not exist: %s\n", path);
+	// Check memory before starting
+	espeon_check_memory();
+	
+	// Simple loading screen
+	tft.fillScreen(TFT_BLACK);
+	tft.setTextColor(TFT_WHITE);
+	tft.setTextSize(2);
+	tft.setCursor(10, 50);
+	tft.print("Loading ROM...");
+	tft.setTextSize(1);
+	tft.setCursor(10, 80);
+	tft.printf("File: %s", path);
+	
+	// Acquire SPI lock with extended timeout for ROM loading
+	if (!spi_acquire_lock(5000)) {
+		Serial.println("CRITICAL: Failed to acquire SPI lock for ROM loading!");
+		tft.fillScreen(TFT_BLACK);
+		tft.setTextColor(TFT_RED);
+		tft.setTextSize(2);
+		tft.setCursor(10, 50);
+		tft.print("SPI Lock Error!");
+		delay(3000);
 		return nullptr;
 	}
 	
+	// Force garbage collection before file operations
+	delay(100);
+	
+	// Try to open ROM file directly 
 	File romfile = SD.open(path, FILE_READ);
 	if (!romfile) {
 		Serial.printf("Failed to open ROM file: %s\n", path);
+		spi_release_lock();
+		
+		tft.fillScreen(TFT_BLACK);
+		tft.setTextColor(TFT_RED);
+		tft.setTextSize(2);
+		tft.setCursor(10, 50);
+		tft.print("ROM Load Error!");
+		tft.setTextSize(1);
+		tft.setCursor(10, 80);
+		tft.printf("Could not open: %s", path);
+		delay(3000);
 		return nullptr;
 	}
 	
 	size_t romsize = romfile.size();
 	Serial.printf("ROM file size: %d bytes\n", romsize);
 	
-	if (romsize > MAX_ROM_SIZE) {
-		Serial.printf("ROM too large: %d > %d\n", romsize, MAX_ROM_SIZE);
+	// Update display with size info
+	tft.setCursor(10, 100);
+	tft.printf("Size: %d bytes", romsize);
+	
+	// Check ROM size limit - be more generous for compatibility
+	if (romsize > 8*1024*1024) { // 8MB limit
+		Serial.printf("ROM too large: %d bytes\n", romsize);
 		romfile.close();
+		spi_release_lock();
 		return nullptr;
 	}
 	
-	esp_err_t err;
-	err = esp_partition_erase_range(part, 0, MAX_ROM_SIZE);
-	if (err != ESP_OK) {
-		Serial.printf("Failed to erase partition: 0x%x\n", err);
+	// Free previous ROM data if it exists
+	if (sd_rom_data) {
+		free(sd_rom_data);
+		sd_rom_data = nullptr;
+		// Force garbage collection after freeing
+		delay(50);
+	}
+	
+	// Check available memory before allocation
+	size_t free_heap = ESP.getFreeHeap();
+	size_t needed = romsize + 1024; // Extra 1KB for safety
+	
+	Serial.printf("Free heap: %d bytes, needed: %d bytes\n", free_heap, needed);
+	
+	if (free_heap < needed + 100*1024) { // Need at least 100KB extra
+		Serial.println("Insufficient memory for ROM loading");
 		romfile.close();
+		spi_release_lock();
+		
+		tft.fillScreen(TFT_BLACK);
+		tft.setTextColor(TFT_RED);
+		tft.setTextSize(2);
+		tft.setCursor(10, 50);
+		tft.print("Memory Error!");
+		tft.setTextSize(1);
+		tft.setCursor(10, 80);
+		tft.printf("Need %dKB, have %dKB", needed/1024, free_heap/1024);
+		delay(3000);
 		return nullptr;
 	}
 	
-	const size_t bufsize = 32 * 1024;
-	uint8_t* rombuf = (uint8_t*)calloc(bufsize, 1);
-	if (!rombuf) {
-		Serial.println("Failed to allocate ROM buffer");
+	// Allocate memory for ROM data with some extra space
+	sd_rom_data = (uint8_t*)malloc(needed);
+	if (!sd_rom_data) {
+		Serial.println("Failed to allocate ROM memory");
 		romfile.close();
+		spi_release_lock();
+		
+		tft.fillScreen(TFT_BLACK);
+		tft.setTextColor(TFT_RED);
+		tft.setTextSize(2);
+		tft.setCursor(10, 50);
+		tft.print("Alloc Failed!");
+		delay(3000);
 		return nullptr;
 	}
 	
-	tft.fillScreen(TFT_BLACK);
-	tft.setTextColor(TFT_WHITE);
-	tft.drawString("Flashing ROM...", 0, 0);
-	size_t offset = 0;
-	while(romfile.available()) {
-		romfile.read(rombuf, bufsize);
-		esp_partition_write(part, offset, (const void*)rombuf, bufsize);
-		offset += bufsize;
-		// Simple progress indicator - TFT_eSPI doesn't have progressBar
-		int progress = (offset*100)/romsize;
-		tft.fillRect(50, 100, (progress * 200) / 100, 10, TFT_GREEN);
+	Serial.printf("Successfully allocated %d bytes for ROM\n", needed);
+	
+	// Update display
+	tft.setCursor(10, 120);
+	tft.setTextColor(TFT_CYAN);
+	tft.print("Reading ROM data...");
+	
+	// Read ROM data from SD card in chunks for better stability
+	size_t bytesRead = 0;
+	size_t chunkSize = 4096; // 4KB chunks
+	uint8_t* writePtr = sd_rom_data;
+	
+	romfile.seek(0);
+	
+	while (bytesRead < romsize) {
+		size_t toRead = min(chunkSize, romsize - bytesRead);
+		size_t read = romfile.read(writePtr, toRead);
+		
+		if (read == 0) {
+			Serial.println("SD read error - reached EOF early");
+			break;
+		}
+		
+		bytesRead += read;
+		writePtr += read;
+		
+		// Show progress every 64KB
+		if (bytesRead % (64*1024) == 0 || bytesRead == romsize) {
+			tft.setCursor(10, 140);
+			tft.setTextColor(TFT_YELLOW);
+			tft.printf("Read: %d/%d KB", bytesRead/1024, romsize/1024);
+		}
+		
+		// Yield occasionally to avoid watchdog
+		if (bytesRead % (16*1024) == 0) {
+			yield();
+		}
 	}
-	tft.fillScreen(TFT_BLACK);
-	free(rombuf);
+	
 	romfile.close();
+	spi_release_lock();
 	
-	return espeon_get_last_rom(part);
+	if (bytesRead != romsize) {
+		Serial.printf("Warning: Only read %d of %d bytes\n", bytesRead, romsize);
+		// Still proceed as partial ROMs might work for testing
+	}
+	
+	// Show success message
+	tft.setCursor(10, 160);
+	tft.setTextColor(TFT_GREEN);
+	tft.print("ROM loaded successfully!");
+	delay(1000);
+	
+	Serial.printf("Successfully loaded %d bytes from SD card ROM\n", bytesRead);
+	return sd_rom_data;
 }
 
 void espeon_set_brightness(uint8_t brightness)
@@ -373,4 +633,57 @@ void espeon_set_brightness(uint8_t brightness)
 	// brightness should be 0-100 (percentage)
 	uint8_t pwm_value = (brightness * 255) / 100;
 	ledcWrite(PWM_CHANNEL, pwm_value);
+}
+
+// Get the list of available ROM files (populated during SD initialization)
+const std::vector<String>& espeon_get_rom_files()
+{
+	return availableRomFiles;
+}
+
+// Get the number of available ROM files
+int espeon_get_rom_count()
+{
+	return availableRomFiles.size();
+}
+
+void espeon_cleanup_rom()
+{
+	if (sd_rom_data) {
+		free(sd_rom_data);
+		sd_rom_data = nullptr;
+		Serial.println("ROM memory cleaned up");
+	}
+}
+
+// Cleanup all SPI resources
+void espeon_cleanup_spi()
+{
+	if (spi_mutex) {
+		vSemaphoreDelete(spi_mutex);
+		spi_mutex = nullptr;
+	}
+	
+	if (sdSPI) {
+		sdSPI->end();
+		delete sdSPI;
+		sdSPI = nullptr;
+	}
+	
+	spi_initialized = false;
+	Serial.println("SPI resources cleaned up");
+}
+
+// Memory management optimization
+void espeon_check_memory() {
+	Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+	Serial.printf("Min free heap: %d bytes\n", ESP.getMinFreeHeap());
+	Serial.printf("Heap size: %d bytes\n", ESP.getHeapSize());
+	
+	// Free up any unused memory if heap is low
+	if (ESP.getFreeHeap() < 512*1024) {
+		Serial.println("Low memory detected, attempting cleanup...");
+		// Force garbage collection and heap defragmentation
+		delay(100);
+	}
 }

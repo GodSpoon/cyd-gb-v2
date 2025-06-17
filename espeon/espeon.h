@@ -2,6 +2,7 @@
 #define ESPEON_H
 
 #include <Arduino.h>
+#include <vector>
 
 extern volatile bool sram_modified;
 extern uint8_t btn_directions;
@@ -24,5 +25,12 @@ void espeon_load_sram(uint8_t* ram, uint32_t size);
 const uint8_t* espeon_load_rom(const char* path);
 const uint8_t* espeon_load_bootrom(const char* path);
 void espeon_set_brightness(uint8_t brightness);
+void espeon_cleanup_rom();
+void espeon_cleanup_spi();
+void espeon_check_memory();
+
+// ROM file management
+const std::vector<String>& espeon_get_rom_files();
+int espeon_get_rom_count();
 
 #endif
