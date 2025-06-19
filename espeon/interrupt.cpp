@@ -47,6 +47,6 @@ void interrupt(uint8_t n)
 	IF |= n;
 
 	/* Interrupt requested, unhalt CPU if IF and IE have a match */
-	if(interrupt_flush())
+	if(IF & IE & 0x1F)
 		halted = 0;
 }

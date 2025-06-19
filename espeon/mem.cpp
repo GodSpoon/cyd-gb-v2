@@ -33,8 +33,19 @@ uint8_t mem_get_byte(uint16_t i)
 		}
 	}
 
-	if(i >= 0x4000 && i < 0x8000)
+	if(i >= 0x4000 && i < 0x8000) {
+		if (!rombank) {
+			static bool error_logged = false;
+			if (!error_logged) {
+				Serial.printf("ERROR: ROM bank access failed - rombank is NULL at address 0x%04X\n", i);
+				Serial.println("ERROR: This indicates ROM bank allocation failure");
+				Serial.println("WARNING: Returning 0xFF for all ROM reads - game may not work correctly");
+				error_logged = true; // Only log once to avoid spam
+			}
+			return 0xFF; // Return safe value to prevent crash
+		}
 		return rombank[i - 0x4000];
+	}
 
 	else if (i >= 0xA000 && i < 0xC000)
 		return mbc_read_ram(i);
@@ -90,7 +101,7 @@ void mem_write_byte(uint16_t d, uint8_t i)
 		case 0xFF41: lcd_write_stat(i); break;
 		case 0xFF42: lcd_write_scroll_y(i); break;
 		case 0xFF43: lcd_write_scroll_x(i); break;
-		case 0xFF44: lcd_reset(); break;
+		case 0xFF44: /* LY register is read-only, ignore writes */ break;
 		case 0xFF45: lcd_set_ly_compare(i); break;
 		case 0xFF46: { /* OAM DMA */
 			/* Check if address overlaps with RAM or ROM */
@@ -116,9 +127,61 @@ void mem_write_byte(uint16_t d, uint8_t i)
 		case 0xFF4A: lcd_set_window_y(i); break;
 		case 0xFF4B: lcd_set_window_x(i); break;
 		case 0xFF50: { /* Lock bootROM */
+			Serial.println("MMU: Bootrom disable requested via 0xFF50");
 			const uint8_t* rom_bank0 = espeon_get_rom_bank(0);
 			if (rom_bank0) {
-				memcpy(&mem[0x0000], &rom_bank0[0x0000], 0x100);
+				// CRITICAL FIX: Many Game Boy ROMs have 0xFF padding in the first 256 bytes
+				// because that area is normally handled by boot ROM. We need to be selective
+				// about what we copy to avoid overwriting critical interrupt vectors with 0xFF.
+				
+				// Check if ROM has valid interrupt vectors (non-0xFF values)
+				bool rom_has_valid_vectors = false;
+				for (int i = 0; i < 0x100; i += 8) { // Check RST vectors (0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38)
+					if (rom_bank0[i] != 0xFF) {
+						rom_has_valid_vectors = true;
+						break;
+					}
+				}
+				
+				if (rom_has_valid_vectors) {
+					// ROM has valid vectors, safe to copy the whole first 256 bytes
+					Serial.println("MMU: ROM has valid interrupt vectors, copying full 0x0000-0x00FF");
+					memcpy(&mem[0x0000], &rom_bank0[0x0000], 0x100);
+				} else {
+					// ROM has 0xFF padding in vector area, only copy safe areas
+					Serial.println("MMU: ROM has 0xFF padding in vector area, selective copy to preserve safety");
+					
+					// Keep our safe NOP vectors at interrupt addresses, but copy other areas
+					// Copy areas that are not critical interrupt vectors
+					for (int addr = 0x00; addr < 0x100; addr++) {
+						// Skip RST vectors (0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38) 
+						// and interrupt vectors (0x40, 0x48, 0x50, 0x58, 0x60)
+						if (addr == 0x00 || addr == 0x08 || addr == 0x10 || addr == 0x18 ||
+						    addr == 0x20 || addr == 0x28 || addr == 0x30 || addr == 0x38 ||
+						    addr == 0x40 || addr == 0x48 || addr == 0x50 || addr == 0x58 || addr == 0x60) {
+							// Keep our safe NOP at these critical addresses
+							continue;
+						}
+						
+						// For other addresses, copy from ROM if not 0xFF
+						if (rom_bank0[addr] != 0xFF) {
+							mem[addr] = rom_bank0[addr];
+						}
+					}
+				}
+				
+				usebootrom = false;  // Disable bootrom mode
+				Serial.println("MMU: Bootrom disabled, ROM bank 0 selectively mapped to 0x0000-0x00FF");
+				
+				// Verification: Check that critical address 0x0038 is not 0xFF
+				Serial.printf("MMU: Post-disable verification - Address 0x0038: 0x%02X\n", mem[0x0038]);
+				if (mem[0x0038] == 0xFF) {
+					Serial.println("WARNING: Address 0x0038 still contains 0xFF after bootrom disable!");
+					Serial.println("WARNING: This will cause infinite RST 38 loop - keeping safe NOP");
+					mem[0x0038] = 0x00; // Force safe NOP
+				}
+			} else {
+				Serial.println("ERROR: MMU: Failed to get ROM bank 0 for bootrom disable");
 			}
 			break;
 		}
@@ -184,6 +247,38 @@ bool mmu_init(const uint8_t* bootrom)
 			return false;
 		}
 		Serial.printf("MMU: Main memory allocated successfully at %p\n", mem);
+	
+	// CRITICAL: Initialize critical interrupt vectors with safe NOPs to prevent infinite loops
+	// This is a safety measure in case ROM loading fails
+	Serial.println("MMU: Initializing critical memory locations with safe values");
+	mem[0x0000] = 0x00; // NOP
+	mem[0x0008] = 0x00; // RST 08 vector 
+	mem[0x0010] = 0x00; // RST 10 vector
+	mem[0x0018] = 0x00; // RST 18 vector
+	mem[0x0020] = 0x00; // RST 20 vector
+	mem[0x0028] = 0x00; // RST 28 vector
+	mem[0x0030] = 0x00; // RST 30 vector
+	mem[0x0038] = 0x00; // RST 38 vector - CRITICAL for our infinite loop issue
+	mem[0x0040] = 0x00; // VBlank interrupt vector
+	mem[0x0048] = 0x00; // LCDC status interrupt vector
+	mem[0x0050] = 0x00; // Timer overflow interrupt vector
+	mem[0x0058] = 0x00; // Serial transfer completion interrupt vector
+	mem[0x0060] = 0x00; // High-to-low of pin number P10-P13 interrupt vector
+	Serial.println("MMU: Critical memory locations initialized with NOPs for safety");
+	
+	// Initialize LCD registers to reasonable defaults to prevent polling loops
+	mem[0xFF40] = 0x91; // LCDC - LCD enabled, BG enabled, Window tilemap select
+	mem[0xFF41] = 0x00; // STAT - Mode 0 (H-Blank)
+	mem[0xFF42] = 0x00; // SCY - Scroll Y
+	mem[0xFF43] = 0x00; // SCX - Scroll X  
+	mem[0xFF44] = 0x00; // LY - LCD Y coordinate (will be updated by LCD)
+	mem[0xFF45] = 0x00; // LYC - LY Compare
+	mem[0xFF47] = 0xFC; // BGP - BG Palette Data
+	mem[0xFF48] = 0xFF; // OBP0 - Object Palette 0 Data
+	mem[0xFF49] = 0xFF; // OBP1 - Object Palette 1 Data
+	mem[0xFF4A] = 0x00; // WY - Window Y Position
+	mem[0xFF4B] = 0x00; // WX - Window X Position
+	Serial.println("MMU: LCD registers initialized to prevent polling loops");
 	}
 	
 	Serial.println("MMU: Initializing MBC");
@@ -221,8 +316,24 @@ bool mmu_init(const uint8_t* bootrom)
 	if (rom_bank0) {
 		Serial.println("MMU: Copying ROM bank 0 data to memory");
 		memcpy(&mem[0x0000], &rom_bank0[0x0000], 0x4000);
+		
+		// Verify ROM bank 0 was copied correctly
+		Serial.printf("MMU: Verification - First few bytes: %02X %02X %02X %02X\n", 
+		              mem[0x0000], mem[0x0001], mem[0x0002], mem[0x0003]);
+		Serial.printf("MMU: Verification - Address 0x0038: %02X (should NOT be 0xFF)\n", mem[0x0038]);
+		Serial.printf("MMU: Verification - Nintendo logo start (0x0104): %02X %02X %02X %02X\n",
+		              mem[0x0104], mem[0x0105], mem[0x0106], mem[0x0107]);
+		
+		// Critical check: ensure 0x0038 is not 0xFF
+		if (mem[0x0038] == 0xFF) {
+			Serial.println("ERROR: MMU: Critical - Address 0x0038 contains 0xFF after ROM copy!");
+			Serial.println("ERROR: MMU: This will cause infinite RST 38 loop!");
+			return false;
+		}
 	} else {
 		Serial.println("ERROR: MMU: Failed to get ROM bank 0 for normal mode");
+		Serial.println("ERROR: MMU: Cannot proceed without valid ROM bank 0 data");
+		return false;
 	}
 
 	// Default values if bootrom is not present
@@ -242,9 +353,9 @@ bool mmu_init(const uint8_t* bootrom)
 	mem[0xFF25] = 0xF3;
 	mem[0xFF26] = 0xF1;
 	mem[0xFF40] = 0x91;
-	mem[0xFF47] = 0xFC;
-	mem[0xFF48] = 0xFF;
-	mem[0xFF49] = 0xFF;
+	mem[0xFF47] = 0xE4;  // Background palette: 11 10 01 00 (proper dark to light progression)
+	mem[0xFF48] = 0xE4;  // Sprite palette 1: same as background
+	mem[0xFF49] = 0xE4;  // Sprite palette 2: same as background
 	
 	Serial.println("MMU: Initialization completed successfully");
 	return true;

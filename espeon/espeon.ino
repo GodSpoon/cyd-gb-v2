@@ -5,8 +5,9 @@
 #include "mem.h"
 #include "cpu.h"
 #include "lcd.h"
+#include "interrupt.h"
 #include "espeon.h"
-#include "menu.h"
+// DISABLED: #include "menu.h"  // Touch menu system disabled to avoid SPI conflicts
 
 #include "gbfiles.h"
 
@@ -54,34 +55,76 @@ void setup()
 	              post_alloc_heap, initial_heap - post_alloc_heap);
 	Serial.println("=== EARLY ALLOCATION COMPLETE ===");
 	
-	menu_init();
-	menu_loop();
+	// DISABLED: Touch-based menu system to avoid SPI conflicts
+	// menu_init();
+	// menu_loop();
 	
-	// Give extra time for SPI bus to settle after menu operations
-	Serial.println("Preparing SPI bus for ROM loading...");
-	tft.endWrite();  // Ensure all TFT operations are complete
+	// Display loading message on screen
+	tft.fillScreen(TFT_BLACK);
+	tft.setTextColor(TFT_WHITE);
+	tft.setTextSize(2);
+	tft.setCursor(10, 50);
+	tft.print("Auto-Loading ROM");
+	tft.setTextSize(1);
+	tft.setCursor(10, 80);
+	tft.print("Touch disabled - loading first ROM");
 	
-	// Gentle SPI coordination (no aggressive reset to avoid callback duplication)
-	delay(50);       // Brief delay for SPI bus to settle
+	// Show 3-second countdown
+	for (int countdown = 3; countdown > 0; countdown--) {
+		tft.fillRect(10, 100, 300, 20, TFT_BLACK); // Clear countdown area
+		tft.setCursor(10, 100);
+		tft.setTextColor(TFT_YELLOW);
+		tft.setTextSize(2);
+		tft.printf("Starting in %d...", countdown);
+		delay(1000);
+	}
 	
-	Serial.println("SPI bus ready for ROM loading");
+	tft.fillScreen(TFT_BLACK);
+	tft.setTextColor(TFT_WHITE);
+	tft.setTextSize(2);
+	tft.setCursor(10, 50);
+	tft.print("Loading ROM...");
+	tft.setTextSize(1);
+	tft.setCursor(10, 80);
+	tft.print("Scanning SD card for .gb files");
 	
 	espeon_check_memory();
 	
-	Serial.println("Loading ROM...");
-	const char* selected_rom_path = menu_get_rompath();
-	if (selected_rom_path) {
-		Serial.printf("User selected ROM: %s\n", selected_rom_path);
-	} else {
-		Serial.println("No ROM selected from menu, trying first available ROM");
-		// Try to get the first available ROM
-		if (espeon_get_rom_count() > 0) {
-			const auto& rom_files = espeon_get_rom_files();
-			selected_rom_path = rom_files[0].c_str();
-			Serial.printf("Using first ROM: %s\n", selected_rom_path);
+	Serial.println("Auto-loading first ROM from SD card...");
+	const char* selected_rom_path = nullptr;
+	
+	// Automatically select the first available ROM from SD card
+	if (espeon_get_rom_count() > 0) {
+		const auto& rom_files = espeon_get_rom_files();
+		selected_rom_path = rom_files[0].c_str();
+		Serial.printf("Auto-selected first ROM: %s\n", selected_rom_path);
+		
+		// Show selected ROM on screen
+		tft.fillRect(10, 100, 300, 40, TFT_BLACK); // Clear previous text
+		tft.setCursor(10, 100);
+		tft.setTextColor(TFT_GREEN);
+		tft.print("Found ROM:");
+		tft.setCursor(10, 120);
+		// Extract just the filename for display
+		String displayName = String(selected_rom_path);
+		int lastSlash = displayName.lastIndexOf('/');
+		if (lastSlash >= 0) {
+			displayName = displayName.substring(lastSlash + 1);
 		}
+		tft.printf("%s", displayName.c_str());
+	} else {
+		Serial.println("No ROM files found on SD card");
+		tft.fillRect(10, 100, 300, 40, TFT_BLACK); // Clear previous text
+		tft.setCursor(10, 100);
+		tft.setTextColor(TFT_YELLOW);
+		tft.print("No .gb files found on SD");
+		tft.setCursor(10, 120);
+		tft.print("Trying internal ROM...");
 	}
 	
+	// Give user time to see the selected ROM
+	delay(1500);
+
 	const uint8_t* rom = espeon_load_rom(selected_rom_path);
 	if (!rom) {
 		Serial.println("Failed to load ROM from SD, checking for internal ROM");
@@ -150,9 +193,23 @@ void setup()
 		lcd_cycle(cycles);
 		timer_cycle(cycles);
 		
+		// Force VBlank interrupt occasionally to help break infinite loops, but let LCD timing control LY
+		static uint32_t last_vblank_time = 0;
+		static uint32_t frame_counter = 0;
+		uint32_t current_time = millis();
+		
+		// Generate VBlank every ~16.7ms but don't interfere with natural LY progression
+		uint32_t vblank_interval = 16 + (frame_counter % 4 == 0 ? 1 : 0);
+		if (current_time - last_vblank_time >= vblank_interval) {
+			// Only force VBlank interrupt, let lcd_cycle() handle LY updates naturally
+			interrupt(0x01); // Force VBlank interrupt
+			last_vblank_time = current_time;
+			frame_counter++;
+		}
+		
 		// Yield occasionally to prevent watchdog timeouts
 		static uint32_t yield_counter = 0;
-		if (++yield_counter >= 100) {
+		if (++yield_counter >= 50) { // More frequent yielding
 			yield_counter = 0;
 			yield();
 		}

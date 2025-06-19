@@ -52,11 +52,13 @@ struct LCDC {
 	uint8_t scroll_y;
 	uint8_t window_x;
 	uint8_t window_y;
+	uint8_t sprcount;
+	struct sprite spr[10];
 };
 
 static LCDC lcdc;
 
-static uint8_t bgpalette[] = {3, 2, 1, 0};
+static uint8_t bgpalette[] = {0, 1, 2, 3};
 static uint8_t sprpalette1[] = {0, 1, 2, 3};
 static uint8_t sprpalette2[] = {0, 1, 2, 3};
 
@@ -363,6 +365,11 @@ static void render_line(void *arg)
 				espeon_end_frame();
 			}
 		}
+		
+		// Feed watchdog every few lines to prevent timeout
+		if ((line % 16) == 0) {
+			yield();
+		}
 	}
 }
 
@@ -373,75 +380,87 @@ void lcd_cycle(uint32_t cycles)
 	
 	lcd_cycles += cycles;
   
-	if(lcd_line >= 144) {
-		if (lcd_mode != 1) {
-			/* Mode 1: Vertical blanking */
-			if (mode1_vblank_int) {
-				interrupt(INTR_LCDSTAT);
-			}
-			interrupt(INTR_VBLANK);
-			lcd_stat_tracker = 0;
-			lcd_mode = 1;
-			
-			//espeon_end_frame();
-		}
-		if (lcd_cycles >= SCANLINE_CYCLES) {
-			lcd_cycles -= SCANLINE_CYCLES;
-			//lcd_cycles = 0;
-			++lcd_line;
-			if (lcd_line > 153) {
-				lcd_line = 0;
-			}
-			lcd_match_lyc();
-		}
-	}
-	else if(lcd_cycles < MODE2_BOUNDS) {
-		if (lcd_mode != 2) {
-			if (mode2_oam_int) {
-				interrupt(INTR_LCDSTAT);
-			}
-			lcd_stat_tracker = 1;
-			lcd_mode = 2;
-			
-			/* Mode 2: Scanning OAM for (X, Y) coordinates of sprites that overlap this line */
-			// lcdc.sprcount = scan_sprites(lcdc.spr, lcd_line, lcdc.sprite_size);
-			// if (lcdc.sprcount)
-				// sort_sprites(lcdc.spr, lcdc.sprcount);
-		}
-	}
-	else if(lcd_cycles < MODE3_BOUNDS) {
-		if (lcd_mode != 3) {
-			lcd_stat_tracker = 1;
-			lcd_mode = 3;
-			
-			/* send scanline early */
-			lcdc.lcd_line = lcd_line;
-			xQueueSend(lcdqueue, &lcdc, 0);
-			
-			/* Mode 3: Reading OAM and VRAM to generate the picture */
-			// fbuffer_t* b = espeon_get_framebuffer();
-			// lcd_set_palettes(lcdc);
-			// draw_bg_and_window(b, lcd_line, lcdc);
-			// draw_sprites(b, lcd_line, sprcount, spr, lcdc);
-		}
-	}
-	else if(lcd_cycles < MODE0_BOUNDS) {
-		if (lcd_mode != 0) {
-			/* Mode 0: Horizontal blanking */
-			if (mode0_hblank_int) {
-				interrupt(INTR_LCDSTAT);
-			}
-			lcd_stat_tracker = 3;
-			lcd_mode = 0;
-		}
-	}
-	else {
-		++lcd_line;
-		lcd_match_lyc();
-		lcd_mode = 0;
+	// Ensure LY progresses even with small cycle counts
+	while (lcd_cycles >= SCANLINE_CYCLES) {
 		lcd_cycles -= SCANLINE_CYCLES;
-		//lcd_cycles = 0;
+		++lcd_line;
+		if (lcd_line > 153) {
+			lcd_line = 0;
+		}
+		// Update LY register directly in memory (not through mem_write_byte to avoid reset)
+		mem[0xFF44] = lcd_line;
+		lcd_match_lyc();
+		
+		// Update mode based on current line
+		if (lcd_line >= 144) {
+			if (lcd_mode != 1) {
+				/* Mode 1: Vertical blanking */
+				if (mode1_vblank_int) {
+					interrupt(INTR_LCDSTAT);
+				}
+				interrupt(INTR_VBLANK);
+				lcd_stat_tracker = 0;
+				lcd_mode = 1;
+			}
+		} else {
+			// For visible lines, set mode based on cycle position within scanline
+			if (lcd_mode != 0) {
+				lcd_mode = 0; // Default to HBlank for simplicity
+				lcd_stat_tracker = 3;
+			}
+		}
 	}
+	
+	// Handle sub-scanline LCD modes for visible lines
+	if(lcd_line < 144) {
+		if(lcd_cycles < MODE2_BOUNDS) {
+			if (lcd_mode != 2) {
+				if (mode2_oam_int) {
+					interrupt(INTR_LCDSTAT);
+				}
+				lcd_stat_tracker = 1;
+				lcd_mode = 2;
+				
+				/* Mode 2: Scanning OAM for (X, Y) coordinates of sprites that overlap this line */
+				lcdc.sprcount = scan_sprites(lcdc.spr, lcd_line, lcdc.sprite_size);
+				if (lcdc.sprcount)
+					sort_sprites(lcdc.spr, lcdc.sprcount);
+			}
+		}
+		else if(lcd_cycles < MODE3_BOUNDS) {
+			if (lcd_mode != 3) {
+				lcd_stat_tracker = 1;
+				lcd_mode = 3;
+				
+				/* send scanline early */
+				lcdc.lcd_line = lcd_line;
+				xQueueSend(lcdqueue, &lcdc, 0);
+				
+				/* Mode 3: Reading OAM and VRAM to generate the picture */
+				fbuffer_t* b = espeon_get_framebuffer();
+				lcd_set_palettes(lcdc);
+				draw_bg_and_window(b, lcd_line, lcdc);
+				if(lcdc.sprites_enabled && lcdc.sprcount) {
+					draw_sprites(b, lcd_line, lcdc.sprcount, lcdc.spr, lcdc);
+				}
+			}
+		}
+		else if(lcd_cycles < MODE0_BOUNDS) {
+			if (lcd_mode != 0) {
+				/* Mode 0: Horizontal blanking */
+				if (mode0_hblank_int) {
+					interrupt(INTR_LCDSTAT);
+				}
+				lcd_stat_tracker = 3;
+				lcd_mode = 0;
+			}
+		}
+	}
+	
+	// Update STAT register to reflect current LCD mode
+	uint8_t stat = mem_get_byte(0xFF41);
+	stat = (stat & 0xFC) | (lcd_mode & 0x03);
+	mem_write_byte(0xFF41, stat);
 }
 
 bool lcd_init()
@@ -457,6 +476,14 @@ bool lcd_init()
 	Serial.println("LCD: Writing control register");
 	lcd_write_control(mem[0xFF40]);
 	Serial.println("LCD: Control register written");
+	
+	// Initialize LCD state
+	lcdc.lcd_enabled = 1;
+	lcd_mode = 0;
+	lcd_line = 0;
+	lcd_cycles = 0;
+	Serial.printf("LCD: Initial state - enabled: %d, mode: %d, line: %d\n", 
+	              lcdc.lcd_enabled, lcd_mode, lcd_line);
 	
 	Serial.println("LCD: Creating render task");
 	xTaskCreatePinnedToCore(&render_line, "renderScanline", 4096, NULL, 5, NULL, 0);

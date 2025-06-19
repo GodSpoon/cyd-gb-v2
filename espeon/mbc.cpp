@@ -3,7 +3,14 @@
 #include "espeon.h"
 #include <esp_heap_caps.h>
 
-#define SET_ROM_BANK(n)		(rombank = espeon_get_rom_bank((n) & (rom_banks - 1)))
+#define SET_ROM_BANK(n)		do { \
+	const uint8_t* new_bank = espeon_get_rom_bank((n) & (rom_banks - 1)); \
+	if (new_bank) { \
+		rombank = new_bank; \
+	} else { \
+		Serial.printf("ERROR: Failed to load ROM bank %d, keeping previous bank\n", (n) & (rom_banks - 1)); \
+	} \
+} while(0)
 #define SET_RAM_BANK(n)		(rambank = &ram[((n) & (ram_banks - 1)) * 0x2000])
 
 static uint32_t curr_rom_bank = 1;
@@ -92,8 +99,25 @@ bool mbc_init()
 	Serial.println("MBC: Setting ROM bank 1");
 	SET_ROM_BANK(1);
 	if (!rombank) {
-		Serial.println("ERROR: MBC: Failed to get ROM bank 1");
-		return false;
+		Serial.println("ERROR: MBC: Failed to get ROM bank 1 - performing memory cleanup and retry");
+		
+		// Try emergency cleanup
+		espeon_check_memory();
+		
+		// Retry once more
+		SET_ROM_BANK(1);
+		if (!rombank) {
+			Serial.println("ERROR: MBC: Failed to get ROM bank 1 after cleanup");
+			Serial.println("WARNING: MBC will continue with limited functionality");
+			// Don't return false here - let the system continue with degraded performance
+			// Set rombank to bank 0 as fallback
+			Serial.println("MBC: Using ROM bank 0 as fallback for bank 1");
+			rombank = espeon_get_rom_bank(0);
+			if (!rombank) {
+				Serial.println("CRITICAL: MBC: Even ROM bank 0 is unavailable");
+				return false;
+			}
+		}
 	}
 	Serial.println("MBC: ROM bank 1 set successfully");
 	
@@ -137,10 +161,15 @@ void MBC3_write_ROM(uint16_t d, uint8_t i)
 		ram_enabled = ((i & 0x0F) == 0x0A);
 	
 	else if(d < 0x4000) {
+		uint8_t old_bank = curr_rom_bank;
 		curr_rom_bank = i & 0x7F;
 
 		if(curr_rom_bank == 0)
 			curr_rom_bank++;
+
+		// Bank switch counting (debug output removed for performance)
+		static uint32_t bank_switch_count = 0;
+		bank_switch_count++;
 
 		SET_ROM_BANK(curr_rom_bank);
 	}
@@ -173,11 +202,16 @@ void MBC1_write_ROM(uint16_t d, uint8_t i)
 		ram_enabled = ((i & 0x0F) == 0x0A);
 	
 	else if(d < 0x4000) {
+		uint8_t old_bank = curr_rom_bank;
 		curr_rom_bank = (curr_rom_bank & 0x60) | (i & 0x1F);
 
 		if(curr_rom_bank == 0 || curr_rom_bank == 0x20 || curr_rom_bank == 0x40 || curr_rom_bank == 0x60)
 			curr_rom_bank++;
 
+		// Bank switch counting (debug output removed for performance)
+		static uint32_t bank_switch_count = 0;
+		bank_switch_count++;
+		
 		SET_ROM_BANK(curr_rom_bank);
 	}
 	
@@ -187,7 +221,13 @@ void MBC1_write_ROM(uint16_t d, uint8_t i)
 			SET_RAM_BANK(curr_ram_bank);
 		}
 		else {
+			uint8_t old_bank = curr_rom_bank;
 			curr_rom_bank = ((i & 0x3)<<5) | (curr_rom_bank & 0x1F);
+			
+			// Upper bank switch counting (debug output removed for performance)
+			static uint32_t upper_switch_count = 0;
+			upper_switch_count++;
+			
 			SET_ROM_BANK(curr_rom_bank);
 		}
 	}

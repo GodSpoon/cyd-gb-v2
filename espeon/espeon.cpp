@@ -8,6 +8,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/timers.h>
 #include <freertos/task.h>
+#include <esp_heap_caps.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <esp_partition.h>
@@ -32,7 +33,7 @@ static bool spi_initialized = false;
 #define PARTITION_ROM (esp_partition_subtype_t(0x40))
 #define MAX_ROM_SIZE (8*1024*1024)
 #define ROM_BANK_SIZE (16*1024)  // 16KB ROM banks for Game Boy
-#define MAX_ROM_BANKS (1)        // Pre-allocate only 1 bank to save memory
+#define MAX_ROM_BANKS (4)        // Reduce to 4 banks (64KB total) for better memory efficiency
 
 #define JOYPAD_INPUT 5
 #define JOYPAD_ADDR  0x88
@@ -62,7 +63,7 @@ static fbuffer_t* pixels;
 volatile int spi_lock = 0;
 volatile bool sram_modified = false;
 
-uint16_t palette[] = { 0xFFFF, 0xAAAA, 0x5555, 0x2222 };
+uint16_t palette[] = { 0x0000, 0x5555, 0xAAAA, 0xFFFF };
 
 void espeon_render_border(const uint8_t* img, uint32_t size)
 {
@@ -120,10 +121,12 @@ static bool spi_init_sd_interface() {
 	sdSPI->begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 	
 	// Initialize SD with dedicated SPI instance and progressive speed fallback
-	// Try highest speed first, fall back if needed
-	if (SD.begin(SD_CS, *sdSPI, 25000000U)) { // 25MHz
-		Serial.println("SD initialized at 25MHz");
-	} else if (SD.begin(SD_CS, *sdSPI, 10000000U)) { // 10MHz fallback
+	// Try highest speed first, fall back if needed - optimized for 240MHz CPU
+	if (SD.begin(SD_CS, *sdSPI, 40000000U)) { // 40MHz - aggressive for 240MHz CPU
+		Serial.println("SD initialized at 40MHz (high performance)");
+	} else if (SD.begin(SD_CS, *sdSPI, 25000000U)) { // 25MHz fallback
+		Serial.println("SD initialized at 25MHz (performance)");
+	} else if (SD.begin(SD_CS, *sdSPI, 10000000U)) { // 10MHz conservative
 		Serial.println("SD initialized at 10MHz (fallback)");
 	} else if (SD.begin(SD_CS, *sdSPI, 4000000U)) { // 4MHz last resort
 		Serial.println("SD initialized at 4MHz (low speed)");
@@ -144,6 +147,11 @@ void espeon_init(void)
 	delay(1000); // Give time for serial to initialize
 	Serial.println("Espeon v1.0 - CYD GameBoy Emulator");
 	Serial.println("Initializing...");
+	
+	// Set CPU frequency to 240MHz for maximum performance
+	setCpuFrequencyMhz(240);
+	Serial.printf("CPU frequency set to: %d MHz\n", getCpuFrequencyMhz());
+	Serial.printf("APB frequency: %d Hz\n", getApbFrequency());
 	
 	// Initialize SPI mutex for resource management
 	spi_mutex = xSemaphoreCreateMutex();
@@ -237,7 +245,7 @@ void espeon_init(void)
 	
 	pixels = (fbuffer_t*)calloc(GAMEBOY_HEIGHT * GAMEBOY_WIDTH, sizeof(fbuffer_t));
 	
-	const uint32_t pal[] = {0xEFFFDE, 0xADD794, 0x525F73, 0x183442}; // Default greenscale palette
+	const uint32_t pal[] = {0x000000, 0x555555, 0xAAAAAA, 0xFFFFFF}; // Game Boy palette: darkest to lightest (inverted for correct display)
 	espeon_set_palette(pal);
 	
 	// Set final brightness after all initialization is complete
@@ -275,7 +283,9 @@ fbuffer_t* espeon_get_framebuffer(void)
 
 void espeon_clear_framebuffer(fbuffer_t col)
 {
-	memset(pixels, col, sizeof(pixels));
+	for (int i = 0; i < GAMEBOY_HEIGHT * GAMEBOY_WIDTH; i++) {
+		pixels[i] = col;
+	}
 }
 
 void espeon_clear_screen(uint16_t col)
@@ -285,9 +295,14 @@ void espeon_clear_screen(uint16_t col)
 
 void espeon_set_palette(const uint32_t* col)
 {
-	/* RGB888 -> RGB565 */
+	/* RGB888 -> RGB565 conversion (proper order: R5G6B5) */
 	for (int i = 0; i < 4; ++i) {
-		palette[i] = ((col[i]&0xFF)>>3)+((((col[i]>>8)&0xFF)>>2)<<5)+((((col[i]>>16)&0xFF)>>3)<<11);
+		uint8_t r = (col[i] >> 16) & 0xFF; // Red component
+		uint8_t g = (col[i] >> 8) & 0xFF;  // Green component  
+		uint8_t b = col[i] & 0xFF;         // Blue component
+		
+		// Convert to RGB565: RRRRR GGGGGG BBBBB
+		palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
 	}
 }
 
@@ -580,6 +595,31 @@ static const uint8_t* get_rom_bank_streaming(uint16_t bank_number) {
 	// Verify the slot has memory allocated or allocate it now
 	if (!rom_bank_cache[lru_slot]) {
 		Serial.printf("ROM bank cache slot %d not pre-allocated, allocating on-demand...\n", lru_slot);
+		
+		// Check available memory before allocation
+		size_t free_heap = ESP.getFreeHeap();
+		size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+		
+		if (free_heap < ROM_BANK_SIZE + 20*1024 || largest_block < ROM_BANK_SIZE) {
+			Serial.printf("ERROR: Insufficient memory for ROM bank allocation\n");
+			Serial.printf("  Free heap: %d bytes, largest block: %d bytes, need: %d bytes\n", 
+			              free_heap, largest_block, ROM_BANK_SIZE);
+			
+			// Try emergency cleanup and retry
+			Serial.println("Attempting emergency memory cleanup...");
+			espeon_check_memory();
+			
+			free_heap = ESP.getFreeHeap();
+			largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+			Serial.printf("After cleanup - Free heap: %d bytes, largest block: %d bytes\n", 
+			              free_heap, largest_block);
+			
+			if (largest_block < ROM_BANK_SIZE) {
+				Serial.println("ERROR: Still insufficient memory after cleanup");
+				return nullptr;
+			}
+		}
+		
 		rom_bank_cache[lru_slot] = (uint8_t*)malloc(ROM_BANK_SIZE);
 		if (!rom_bank_cache[lru_slot]) {
 			Serial.printf("ERROR: Failed to allocate ROM bank cache slot %d on-demand\n", lru_slot);
@@ -831,6 +871,52 @@ const uint8_t* espeon_load_rom(const char* path)
 			return nullptr;
 		}
 		
+		// Verify ROM bank 0 data was read correctly
+		Serial.printf("ROM: Bank 0 loaded, first bytes: %02X %02X %02X %02X\n",
+		              rom_bank0_permanent[0], rom_bank0_permanent[1], 
+		              rom_bank0_permanent[2], rom_bank0_permanent[3]);
+		Serial.printf("ROM: Bank 0 address 0x0038: %02X (should NOT be 0xFF)\n", rom_bank0_permanent[0x0038]);
+		Serial.printf("ROM: Nintendo logo check (0x0104): %02X %02X %02X %02X\n",
+		              rom_bank0_permanent[0x0104], rom_bank0_permanent[0x0105], 
+		              rom_bank0_permanent[0x0106], rom_bank0_permanent[0x0107]);
+		
+		// Extended debug: Check interrupt vector area
+		Serial.println("ROM: Interrupt vector area analysis:");
+		Serial.printf("  RST 00 (0x00): %02X, RST 08 (0x08): %02X, RST 10 (0x10): %02X, RST 18 (0x18): %02X\n",
+		              rom_bank0_permanent[0x00], rom_bank0_permanent[0x08], 
+		              rom_bank0_permanent[0x10], rom_bank0_permanent[0x18]);
+		Serial.printf("  RST 20 (0x20): %02X, RST 28 (0x28): %02X, RST 30 (0x30): %02X, RST 38 (0x38): %02X\n",
+		              rom_bank0_permanent[0x20], rom_bank0_permanent[0x28], 
+		              rom_bank0_permanent[0x30], rom_bank0_permanent[0x38]);
+		Serial.printf("  VBlank (0x40): %02X, LCDC (0x48): %02X, Timer (0x50): %02X, Serial (0x58): %02X\n",
+		              rom_bank0_permanent[0x40], rom_bank0_permanent[0x48], 
+		              rom_bank0_permanent[0x50], rom_bank0_permanent[0x58]);
+		Serial.printf("  Joypad (0x60): %02X\n", rom_bank0_permanent[0x60]);
+		
+		// Check if this ROM has 0xFF padding in interrupt vector area
+		bool has_ff_padding = true;
+		for (int i = 0; i < 0x100; i += 8) {
+			if (rom_bank0_permanent[i] != 0xFF) {
+				has_ff_padding = false;
+				break;
+			}
+		}
+		
+		if (has_ff_padding) {
+			Serial.println("ROM: This ROM has 0xFF padding in interrupt vector area (normal for many ROMs)");
+			Serial.println("ROM: Bootrom disable will use selective copying to preserve safety vectors");
+		} else {
+			Serial.println("ROM: This ROM has valid interrupt vectors in ROM bank 0");
+		}
+		
+		// Critical safety check
+		if (rom_bank0_permanent[0x0038] == 0xFF) {
+			Serial.println("WARNING: ROM bank 0 has 0xFF at address 0x0038!");
+			Serial.println("WARNING: This may cause infinite RST 38 loop during emulation!");
+			Serial.println("WARNING: Patching ROM bank 0 with NOP at 0x0038 to prevent infinite loop");
+			rom_bank0_permanent[0x0038] = 0x00; // Patch with NOP to prevent infinite loop
+		}
+		
 		spi_release_lock();
 		
 		// Show success message
@@ -1013,25 +1099,29 @@ void espeon_check_memory() {
 	Serial.printf("Heap size: %d bytes\n", heap_size);
 	
 	// Attempt memory cleanup if heap is low
-	if (free_heap < 300*1024) {  // Less than 300KB available
+	if (free_heap < 200*1024) {  // Less than 200KB available (more aggressive threshold)
 		Serial.println("Low memory detected, performing cleanup...");
 		
-		// Clear any cached ROM banks if in streaming mode
+		// Clear any cached ROM banks if in streaming mode (more aggressive)
 		if (rom_streaming_mode) {
+			int banks_freed = 0;
 			for (int i = 0; i < MAX_ROM_BANKS; i++) {
-				if (rom_bank_cache[i] && cached_bank_numbers[i] > 1) { // Keep banks 0 and 1
-					Serial.printf("Clearing cached ROM bank %d\n", cached_bank_numbers[i]);
+				// Keep only bank 0 and most recently used bank
+				if (rom_bank_cache[i] && cached_bank_numbers[i] > 0 && cache_lru_counter[i] < 200) {
+					Serial.printf("Clearing cached ROM bank %d (LRU: %d)\n", cached_bank_numbers[i], cache_lru_counter[i]);
 					free(rom_bank_cache[i]);
 					rom_bank_cache[i] = nullptr;
 					cached_bank_numbers[i] = 0xFFFF;
 					cache_lru_counter[i] = 0;
+					banks_freed++;
 				}
 			}
+			Serial.printf("Freed %d ROM bank cache slots\n", banks_freed);
 		}
 		
-		// Force heap compaction
+		// Force heap compaction with more aggressive approach
 		heap_caps_check_integrity_all(true);
-		delay(50);
+		delay(100); // Give more time for cleanup
 		
 		Serial.printf("After cleanup - Free heap: %d bytes\n", ESP.getFreeHeap());
 	}
@@ -1041,12 +1131,26 @@ void espeon_check_memory() {
 const uint8_t* espeon_get_rom_bank(uint16_t bank_number) {
 	// Special case: Bank 0 is always available
 	if (bank_number == 0) {
+		Serial.printf("DEBUG: espeon_get_rom_bank(0) called - rom_streaming_mode=%d, rom_bank0_permanent=%p, sd_rom_data=%p\n", 
+		              rom_streaming_mode, rom_bank0_permanent, sd_rom_data);
+		
 		if (rom_streaming_mode && rom_bank0_permanent) {
+			Serial.printf("DEBUG: Returning rom_bank0_permanent: %p\n", rom_bank0_permanent);
+			// Verify the data looks reasonable
+			Serial.printf("DEBUG: Bank 0 first bytes: %02X %02X %02X %02X\n",
+			              rom_bank0_permanent[0], rom_bank0_permanent[1], 
+			              rom_bank0_permanent[2], rom_bank0_permanent[3]);
 			return rom_bank0_permanent;
 		} else if (sd_rom_data) {
+			Serial.printf("DEBUG: Returning sd_rom_data: %p\n", sd_rom_data);
+			// Verify the data looks reasonable
+			Serial.printf("DEBUG: Bank 0 first bytes: %02X %02X %02X %02X\n",
+			              sd_rom_data[0], sd_rom_data[1], sd_rom_data[2], sd_rom_data[3]);
 			return sd_rom_data; // In legacy mode, bank 0 is at the start
 		} else {
 			Serial.println("ERROR: No ROM loaded for bank 0 request");
+			Serial.printf("ERROR: rom_streaming_mode=%d, rom_bank0_permanent=%p, sd_rom_data=%p\n", 
+			              rom_streaming_mode, rom_bank0_permanent, sd_rom_data);
 			return nullptr;
 		}
 	}
