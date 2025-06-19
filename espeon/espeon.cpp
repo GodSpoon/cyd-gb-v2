@@ -153,10 +153,22 @@ void espeon_init(void)
 	}
 	Serial.println("SPI mutex created successfully");
 	
-	// Initialize TFT display first (uses HSPI by default)
+	// Initialize backlight PWM BEFORE TFT to ensure PWM control
+	ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+	ledcAttachPin(TFT_BL_PIN, PWM_CHANNEL);
+	// Set brightness to 80% initially for better visibility
+	ledcWrite(PWM_CHANNEL, 204); // 80% of 255
+	
+	// Initialize TFT display (uses HSPI by default)
 	tft.init();
 	tft.setRotation(1); // Landscape orientation for CYD
 	tft.fillScreen(TFT_BLACK);
+	
+	// Re-establish PWM control after TFT init (TFT may override pin)
+	ledcDetachPin(TFT_BL_PIN);
+	ledcAttachPin(TFT_BL_PIN, PWM_CHANNEL);
+	// Set brightness to 80% again
+	espeon_set_brightness(80);
 	
 	// Show startup message on screen
 	tft.setCursor(10, 10);
@@ -166,12 +178,6 @@ void espeon_init(void)
 	tft.setCursor(10, 30);
 	tft.setTextSize(1);
 	tft.print("Initializing...");
-	
-	// Initialize backlight PWM for brightness control
-	ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-	ledcAttachPin(TFT_BL_PIN, PWM_CHANNEL);
-	// Set brightness to 50% (128 out of 255)
-	ledcWrite(PWM_CHANNEL, 128);
 	
 	// Initialize SD card with dedicated SPI interface
 	Serial.println("Initializing SD card...");
@@ -233,6 +239,10 @@ void espeon_init(void)
 	
 	const uint32_t pal[] = {0xEFFFDE, 0xADD794, 0x525F73, 0x183442}; // Default greenscale palette
 	espeon_set_palette(pal);
+	
+	// Set final brightness after all initialization is complete
+	Serial.println("Setting final brightness...");
+	espeon_set_brightness(75); // Set to 75% brightness by default
 }
 
 void espeon_update(void)
@@ -914,9 +924,38 @@ const uint8_t* espeon_load_rom(const char* path)
 
 void espeon_set_brightness(uint8_t brightness)
 {
+	// Clamp brightness to 0-100 range
+	if (brightness > 100) brightness = 100;
+	
 	// brightness should be 0-100 (percentage)
 	uint8_t pwm_value = (brightness * 255) / 100;
+	
+	// Debug output
+	Serial.printf("Setting brightness: %d%% -> PWM value: %d\n", brightness, pwm_value);
+	
+	// Re-establish PWM control (in case something interfered)
+	ledcDetachPin(TFT_BL_PIN);
+	ledcAttachPin(TFT_BL_PIN, PWM_CHANNEL);
+	
+	// Write the PWM value
 	ledcWrite(PWM_CHANNEL, pwm_value);
+	
+	// Additional verification - force pin mode
+	pinMode(TFT_BL_PIN, OUTPUT);
+	ledcAttachPin(TFT_BL_PIN, PWM_CHANNEL);
+}
+
+// Alternative brightness function for troubleshooting (digital on/off)
+void espeon_set_brightness_digital(bool on)
+{
+	Serial.printf("Setting brightness digital: %s\n", on ? "ON" : "OFF");
+	
+	// Detach PWM first
+	ledcDetachPin(TFT_BL_PIN);
+	
+	// Set as digital output
+	pinMode(TFT_BL_PIN, OUTPUT);
+	digitalWrite(TFT_BL_PIN, on ? HIGH : LOW);
 }
 
 // Get the list of available ROM files (populated during SD initialization)

@@ -26,6 +26,7 @@ const uint8_t* espeon_load_rom(const char* path);
 const uint8_t* espeon_load_bootrom(const char* path);
 const uint8_t* espeon_get_rom_bank(uint16_t bank_number);  // For streaming mode ROM access
 void espeon_set_brightness(uint8_t brightness);
+void espeon_set_brightness_digital(bool on); // Alternative for troubleshooting
 void espeon_cleanup_rom();
 void espeon_cleanup_spi();
 void espeon_check_memory();
